@@ -1,0 +1,67 @@
+{
+  "name": "roblox-sync",
+  "displayName": "Roblox Sync",
+  "description": "Bidirectional real-time sync between Roblox Studio and VS Code. Edit your entire game—scripts, instances, and properties—from your editor and see changes instantly in Studio.",
+  "version": "0.1.0",
+  "publisher": "roblox-sync",
+  "icon": "media/logo.png",
+  "license": "SEE LICENSE IN LICENSE.txt",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["workspaceContains:**/.roblox-sync-workspace", "onCommand:robloxSync.connect"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "robloxSync.connect",
+        "title": "Roblox Sync: Start Server"
+      },
+      {
+        "command": "robloxSync.disconnect",
+        "title": "Roblox Sync: Stop Server"
+      },
+      {
+        "command": "robloxSync.installPlugin",
+        "title": "Roblox Sync: Install Studio Plugin"
+      },
+      {
+        "command": "robloxSync.fullSync",
+        "title": "Roblox Sync: Request Full Sync"
+      }
+    ],
+    "configuration": {
+      "title": "Roblox Sync",
+      "properties": {
+        "robloxSync.port": {
+          "type": "number",
+          "default": 34872,
+          "description": "Port for the HTTP sync server"
+        },
+        "robloxSync.projectPath": {
+          "type": "string",
+          "default": "",
+          "description": "Relative path within the workspace for synced files (leave empty to use workspace root)"
+        },
+        "robloxSync.pollInterval": {
+          "type": "number",
+          "default": 0.3,
+          "description": "How often the plugin polls for changes (seconds)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.mjs --production",
+    "watch": "node esbuild.mjs --watch",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.3.0"
+  }
+}

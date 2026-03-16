@@ -1,0 +1,7 @@
+**/*
+!dist/**
+!resources/**
+!media/**
+!package.json
+!README.md
+!LICENSE.txt
