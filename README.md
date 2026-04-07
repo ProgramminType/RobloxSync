@@ -15,7 +15,7 @@
 
 ### 1. Install the VS Code Extension
 
-**Easiest:** Install the pre-built `.vsix` from the [Releases](https://github.com/YOUR_ORG/roblox-sync/releases) page:
+**Easiest:** Install the pre-built `.vsix` from the [Releases](https://github.com/ProgramminType/RobloxSync/releases) page:
 
 ```bash
 code --install-extension roblox-sync-0.1.0.vsix
@@ -35,11 +35,13 @@ Run **Roblox Sync: Install Studio Plugin** from the command palette (Ctrl+Shift+
 
 ### 3. Connect
 
-1. Run **Roblox Sync: Start Server** in VS Code or Cursor
+1. Run **Roblox Sync: Connect to Studio** in VS Code or Cursor (Command Palette: Ctrl+Shift+P)
 2. Open Roblox Studio and enable **Allow HTTP Requests** in Game Settings → Security
 3. Click **Connect** in the Roblox Sync toolbar
 
 Your game opens as a workspace. Edit files and folders; changes sync in real time.
+
+The sync server stops when Studio disconnects, after Studio inactivity (see settings), or when you close the synced workspace window. There is no separate “stop server” command.
 
 ## File Format
 
@@ -57,10 +59,12 @@ Each `init.meta.json` contains `className` and `properties`. The folder name is 
 
 | Command | Description |
 |---------|-------------|
-| **Roblox Sync: Start Server** | Start the sync server (no workspace opened until Studio connects) |
-| **Roblox Sync: Stop Server** | Stop the server |
+| **Roblox Sync: Connect to Studio** | Start listening for the Studio plugin; a workspace opens after Studio connects and full sync completes |
 | **Roblox Sync: Install Studio Plugin** | Copy the plugin to `%LOCALAPPDATA%\Roblox\Plugins` |
-| **Roblox Sync: Request Full Sync** | Trigger a full re-sync from Studio |
+| **Roblox Sync: Enable Cursor Mode** | Shown in the palette when Cursor mode is off; use named folders plus `init.meta.json` with `className` before instances sync |
+| **Roblox Sync: Disable Cursor Mode** | Shown when Cursor mode is on; toggles back to class-named folders creating instances with defaults |
+
+Enable and Disable Cursor Mode are the same toggle; only one appears at a time in the command palette.
 
 ## Configuration
 
@@ -90,7 +94,13 @@ To build the extension yourself:
 cd vscode-extension
 npm install
 npm run build
-npx @vscode/vsce package
+npx @vscode/vsce package --allow-missing-repository
+```
+
+This writes `roblox-sync-0.1.0.vsix` in `vscode-extension/`. Install it from that folder, for example:
+
+```bash
+cursor --install-extension roblox-sync-0.1.0.vsix --force
 ```
 
 ## License

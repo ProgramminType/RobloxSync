@@ -3,8 +3,11 @@ import * as path from "path";
 import * as fs from "fs";
 import { ChangeQueue } from "./changeQueue";
 import { FileManager } from "./fileManager";
+import { InstanceMapper } from "./instanceMapper";
 import { Change, SYNCED_SERVICES, META_FILENAME } from "../types";
 import { fileToChange, directoryToInstanceData } from "../serialization/deserializer";
+import { isScriptClass } from "../serialization/apiDump";
+import { UI } from "../ui/messages";
 
 export class FileWatcher {
   private watchers: vscode.FileSystemWatcher[] = [];
@@ -27,7 +30,6 @@ export class FileWatcher {
     createWatcher.onDidDelete((uri) => this.onFileEvent(uri, "delete"));
 
     this.watchers.push(createWatcher);
-    console.log(`[RobloxSync] File watcher started on ${this.projectRoot}`);
   }
 
   stop(): void {
@@ -97,36 +99,39 @@ export class FileWatcher {
       return;
     }
 
+    const cursorMode = vscode.workspace.getConfiguration("robloxSync").get<boolean>("cursorMode", false);
     const mapper = this.fileManager.getMapper();
-    const basename = path.basename(filePath);
 
     try {
-      // Directory events
+      if (eventType === "create" && fs.existsSync(filePath)) {
+        const parsedInit = mapper.filePathToInstance(filePath);
+        if (parsedInit?.isScript) {
+          this.fileManager.clearMetaScriptAwaitingUserInit(mapper.filePathToInstancePath(filePath));
+        }
+      }
+
       if (eventType === "create" && fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
-        // New directory = potential new instance; read its contents
-        const instanceData = directoryToInstanceData(filePath, mapper);
+        const instancePath = mapper.filePathToInstancePath(filePath);
+        const instanceData = directoryToInstanceData(filePath, mapper, cursorMode);
         if (instanceData) {
-          const instancePath = mapper.filePathToInstancePath(filePath);
           const change: Change = {
             type: "create",
             instancePath,
             instanceData,
             timestamp: Date.now(),
           };
+          this.maybeMarkMetaScriptAwaitingUserInit(change, cursorMode, mapper);
           this.changeQueue.enqueue(change);
         }
         return;
       }
 
       if (eventType === "delete") {
-        // Block deletion of protected service roots (Workspace, Players, etc.)
         const protectedService = this.isProtectedServicePath(filePath);
         if (protectedService) {
           this.paused = true;
           const restored = this.fileManager.restoreService(protectedService);
-          if (restored) {
-            console.log(`[RobloxSync] Restored protected service: ${protectedService}`);
-          } else {
+          if (!restored) {
             fs.mkdirSync(filePath, { recursive: true });
             fs.writeFileSync(
               path.join(filePath, META_FILENAME),
@@ -134,9 +139,7 @@ export class FileWatcher {
               "utf-8"
             );
           }
-          vscode.window.showWarningMessage(
-            `Cannot delete "${protectedService}" — it's a protected Roblox service and has been restored.`
-          );
+          vscode.window.showWarningMessage(UI.protectedServiceRestored(protectedService));
           setTimeout(() => {
             this.paused = false;
           }, 500);
@@ -145,7 +148,6 @@ export class FileWatcher {
 
         const parsed = mapper.filePathToInstance(filePath);
         if (parsed) {
-          // Deleting init.meta.json or init.*.lua deletes the entire object
           const instancePath = mapper.filePathToInstancePath(filePath);
           const change: Change = {
             type: "delete",
@@ -156,7 +158,6 @@ export class FileWatcher {
           return;
         }
 
-        // Directory deletion
         const instancePath = mapper.filePathToInstancePath(filePath);
         const change: Change = {
           type: "delete",
@@ -167,13 +168,44 @@ export class FileWatcher {
         return;
       }
 
-      // File create or update (init.meta.json or init.*.lua)
-      const change = fileToChange(filePath, eventType, mapper);
+      const change = fileToChange(filePath, eventType, mapper, cursorMode);
       if (change) {
+        this.maybeMarkMetaScriptAwaitingUserInit(change, cursorMode, mapper);
         this.changeQueue.enqueue(change);
       }
     } catch (err) {
       console.error(`[RobloxSync] Error processing file event: ${err}`);
     }
+  }
+
+  /** Cursor mode: remember script folders created from meta only (no init.*.lua yet) to block Studio echo. */
+  private maybeMarkMetaScriptAwaitingUserInit(
+    change: Change,
+    cursorMode: boolean,
+    mapper: InstanceMapper
+  ): void {
+    if (!cursorMode || !change.instanceData || change.type === "delete") {
+      return;
+    }
+    if (!isScriptClass(change.instanceData.className)) {
+      return;
+    }
+    const dir = mapper.instancePathToDir(change.instancePath);
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+      return;
+    }
+    if (this.dirHasInitLua(dir)) {
+      return;
+    }
+    this.fileManager.markMetaScriptAwaitingUserInit(change.instancePath);
+  }
+
+  private dirHasInitLua(dirPath: string): boolean {
+    for (const ext of [".server.lua", ".client.lua", ".lua"]) {
+      if (fs.existsSync(path.join(dirPath, "init" + ext))) {
+        return true;
+      }
+    }
+    return false;
   }
 }

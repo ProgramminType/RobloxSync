@@ -1,4 +1,5 @@
 import { Change } from "../types";
+import { coalesceSiblingRenames } from "./coalesceRenames";
 
 export class ChangeQueue {
   private pendingForStudio: Change[] = [];
@@ -14,7 +15,7 @@ export class ChangeQueue {
   drain(): Change[] {
     const changes = this.pendingForStudio;
     this.pendingForStudio = [];
-    return changes;
+    return coalesceSiblingRenames(changes);
   }
 
   pause(): void {

@@ -1,13 +1,19 @@
 import * as fs from "fs";
 import * as path from "path";
+import * as vscode from "vscode";
 import { InstanceData, Change, META_FILENAME, SCRIPT_EXTENSIONS, SYNCED_SERVICES } from "../types";
 import { InstanceMapper } from "./instanceMapper";
 import { serializeMetaContent } from "../serialization/serializer";
-import { loadApiDump, isScriptClass } from "../serialization/apiDump";
+import { loadApiDump, isScriptClass, resolveClassName } from "../serialization/apiDump";
 
 export class FileManager {
   private mapper: InstanceMapper;
   private lastTree: InstanceData[] = [];
+  /**
+   * Cursor mode: instance paths (normalized) for scripts created from VS Code via init.meta.json only —
+   * suppress Studio→disk init.*.lua writes until the user adds the script file locally.
+   */
+  private vscodeMetaScriptNoInitPaths = new Set<string>();
 
   constructor(
     private projectRoot: string,
@@ -21,6 +27,84 @@ export class FileManager {
     return this.mapper;
   }
 
+  /** Dot path without leading `game.` (e.g. Workspace.Foo.Bar). */
+  static normalizeInstancePathKey(instancePath: string): string {
+    const parts = instancePath.split(".").filter(Boolean);
+    if (parts.length > 0 && parts[0].toLowerCase() === "game") {
+      parts.shift();
+    }
+    return parts.join(".");
+  }
+
+  markMetaScriptAwaitingUserInit(instancePath: string): void {
+    this.vscodeMetaScriptNoInitPaths.add(FileManager.normalizeInstancePathKey(instancePath));
+  }
+
+  clearMetaScriptAwaitingUserInit(instancePath: string): void {
+    this.vscodeMetaScriptNoInitPaths.delete(FileManager.normalizeInstancePathKey(instancePath));
+  }
+
+  private scriptSourceMeaningful(instance: InstanceData): boolean {
+    const s = instance.properties["Source"];
+    return typeof s === "string" && s.trim().length > 0;
+  }
+
+  /**
+   * When to write init.*.lua from Studio-applied data (cursor mode nuances).
+   */
+  private shouldWriteInitLuaFromStudio(
+    instanceDotPath: string,
+    instance: InstanceData,
+    fullTree: boolean
+  ): boolean {
+    if (!isScriptClass(instance.className)) {
+      return false;
+    }
+    const key = FileManager.normalizeInstancePathKey(instanceDotPath);
+    // Meta-only VS Code scripts: defer init until Source is non-empty (Studio edit or template filled)
+    if (this.vscodeMetaScriptNoInitPaths.has(key)) {
+      if (this.scriptSourceMeaningful(instance)) {
+        this.vscodeMetaScriptNoInitPaths.delete(key);
+      } else {
+        return false;
+      }
+    }
+    const cursorMode = vscode.workspace.getConfiguration("robloxSync").get<boolean>("cursorMode", false);
+    if (!cursorMode) {
+      return true;
+    }
+    if (fullTree) {
+      return true;
+    }
+    // Incremental Studio apply: always write init.*.lua (empty Source ok); meta-only bypass handled above
+    return true;
+  }
+
+  /** init.server.lua / init.client.lua / init.lua path from init.meta.json className, or null. */
+  private resolveScriptInitPathFromMeta(dirPath: string): string | null {
+    const metaPath = path.join(dirPath, META_FILENAME);
+    if (!fs.existsSync(metaPath)) {
+      return null;
+    }
+    try {
+      const json = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as { className?: unknown };
+      if (json.className === undefined || json.className === null || String(json.className).trim() === "") {
+        return null;
+      }
+      const cn = resolveClassName(String(json.className));
+      if (!isScriptClass(cn)) {
+        return null;
+      }
+      const ext = SCRIPT_EXTENSIONS[cn];
+      if (!ext) {
+        return null;
+      }
+      return path.join(dirPath, "init" + ext);
+    } catch {
+      return null;
+    }
+  }
+
   async writeFullTree(tree: InstanceData[]): Promise<void> {
     this.lastTree = tree;
 
@@ -32,7 +116,7 @@ export class FileManager {
     }
 
     for (const serviceData of tree) {
-      this.writeInstance(serviceData, this.projectRoot);
+      this.writeInstance(serviceData, this.projectRoot, serviceData.name, true);
     }
   }
 
@@ -45,7 +129,7 @@ export class FileManager {
     if (!serviceData) {
       return false;
     }
-    this.writeInstance(serviceData, this.projectRoot);
+    this.writeInstance(serviceData, this.projectRoot, serviceData.name, true);
     return true;
   }
 
@@ -53,14 +137,13 @@ export class FileManager {
    * Every instance is a folder. Scripts get init.*.lua for source.
    * All instances get init.meta.json for className + properties.
    */
-  private writeInstance(instance: InstanceData, parentDir: string): void {
+  private writeInstance(instance: InstanceData, parentDir: string, instanceDotPath: string, fullTree: boolean): void {
     const dirPath = path.join(parentDir, instance.name);
     ensureDir(dirPath);
 
     const script = isScriptClass(instance.className);
 
-    // Write script source file
-    if (script) {
+    if (script && this.shouldWriteInitLuaFromStudio(instanceDotPath, instance, fullTree)) {
       const ext = SCRIPT_EXTENSIONS[instance.className];
       const initPath = path.join(dirPath, "init" + ext);
       const source = (instance.properties["Source"] as string) ?? "";
@@ -82,7 +165,7 @@ export class FileManager {
         child.name = `${baseName}_${count + 1}`;
       }
 
-      this.writeInstance(child, dirPath);
+      this.writeInstance(child, dirPath, `${instanceDotPath}.${child.name}`, fullTree);
     }
   }
 
@@ -114,7 +197,8 @@ export class FileManager {
     }
 
     ensureDir(parentPath);
-    this.writeInstance(change.instanceData, parentPath);
+    const dotPath = FileManager.normalizeInstancePathKey(change.instancePath);
+    this.writeInstance(change.instanceData, parentPath, dotPath, false);
   }
 
   private handleStudioUpdate(change: Change): void {
@@ -131,7 +215,11 @@ export class FileManager {
       const metaPath = path.join(dirPath, META_FILENAME);
       fs.writeFileSync(metaPath, serializeMetaContent(change.instanceData), "utf-8");
 
-      if (isScriptClass(change.instanceData.className)) {
+      const dotPath = FileManager.normalizeInstancePathKey(change.instancePath);
+      if (
+        isScriptClass(change.instanceData.className) &&
+        this.shouldWriteInitLuaFromStudio(dotPath, change.instanceData, false)
+      ) {
         const ext = SCRIPT_EXTENSIONS[change.instanceData.className];
         const initPath = path.join(dirPath, "init" + ext);
         const source = (change.instanceData.properties["Source"] as string) ?? "";
@@ -139,10 +227,24 @@ export class FileManager {
       }
     } else if (change.property && change.value !== undefined) {
       if (change.property === "Source") {
-        // Update the script source file
+        const cursorMode = vscode.workspace.getConfiguration("robloxSync").get<boolean>("cursorMode", false);
+        const dotPath = FileManager.normalizeInstancePathKey(change.instancePath);
+        const sourceText =
+          typeof change.value === "string" ? change.value : String(change.value ?? "");
+        if (cursorMode && this.vscodeMetaScriptNoInitPaths.has(dotPath) && sourceText.trim().length === 0) {
+          return;
+        }
+        if (cursorMode && this.vscodeMetaScriptNoInitPaths.has(dotPath) && sourceText.trim().length > 0) {
+          this.clearMetaScriptAwaitingUserInit(change.instancePath);
+        }
         const luaFile = findScriptInit(dirPath);
         if (luaFile) {
-          fs.writeFileSync(luaFile, change.value as string, "utf-8");
+          fs.writeFileSync(luaFile, sourceText, "utf-8");
+        } else {
+          const initPath = this.resolveScriptInitPathFromMeta(dirPath);
+          if (initPath && sourceText.trim().length > 0) {
+            fs.writeFileSync(initPath, sourceText, "utf-8");
+          }
         }
       } else {
         // Update a single property in init.meta.json

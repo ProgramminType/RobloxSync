@@ -11,22 +11,22 @@ export class StatusBarManager implements vscode.Disposable {
 
   setConnected(port: number): void {
     this.item.text = `$(plug) Roblox Sync :${port}`;
-    this.item.tooltip = "Roblox Studio Sync — Server running. Click to stop.";
-    this.item.command = "robloxSync.disconnect";
+    this.item.tooltip = "Roblox Sync — listening for Studio. Plugin connects automatically when HTTP is enabled.";
+    this.item.command = undefined;
     this.item.backgroundColor = undefined;
   }
 
   setDisconnected(): void {
     this.item.text = "$(debug-disconnect) Roblox Sync";
-    this.item.tooltip = "Roblox Studio Sync — Not running. Click to start.";
+    this.item.tooltip = "Roblox Sync — not listening. Click to run Connect to Studio.";
     this.item.command = "robloxSync.connect";
     this.item.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
   }
 
   setPluginConnected(): void {
-    this.item.text = "$(check) Roblox Sync (Studio Connected)";
-    this.item.tooltip = "Roblox Studio Sync — Studio plugin connected.";
-    this.item.command = "robloxSync.disconnect";
+    this.item.text = "$(check) Roblox Sync (Studio)";
+    this.item.tooltip = "Roblox Studio Sync — Studio connected.";
+    this.item.command = undefined;
   }
 
   dispose(): void {

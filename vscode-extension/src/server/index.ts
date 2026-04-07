@@ -3,6 +3,7 @@ import { RouteHandler } from "./routes";
 import { FileManager } from "../sync/fileManager";
 import { ChangeQueue } from "../sync/changeQueue";
 import { FileWatcher } from "../sync/fileWatcher";
+import * as syncLog from "../syncLog";
 
 export class SyncServer {
   private server: http.Server | null = null;
@@ -31,12 +32,13 @@ export class SyncServer {
         this.routeHandler.handle(req, res);
       });
 
-      this.server.on("error", (err) => {
+      this.server.on("error", (err: NodeJS.ErrnoException) => {
+        const code = err.code ? ` (${err.code})` : "";
+        syncLog.errorLine(`HTTP server: ${err.message}${code}`);
         reject(err);
       });
 
-      this.server.listen(this.port, () => {
-        console.log(`[RobloxSync] HTTP server listening on port ${this.port}`);
+      this.server.listen(this.port, "127.0.0.1", () => {
         resolve();
       });
     });
@@ -48,12 +50,34 @@ export class SyncServer {
         resolve();
         return;
       }
-      this.server.close(() => {
+      const srv = this.server;
+      // Studio polls /api/status with keep-alive; without this, .close() may never finish.
+      srv.closeAllConnections();
+
+      let done = false;
+      const finish = () => {
+        if (done) {
+          return;
+        }
+        done = true;
         this.server = null;
-        console.log("[RobloxSync] HTTP server stopped");
         resolve();
-      });
+      };
+
+      srv.close(() => finish());
+      setTimeout(finish, 2000);
     });
+  }
+
+  /** Used when the process is exiting; `stop()` may not run in time for `process.on("exit")`. */
+  forceCloseHttpSync(): void {
+    if (!this.server) {
+      return;
+    }
+    const srv = this.server;
+    this.server = null;
+    srv.closeAllConnections();
+    srv.close();
   }
 
   isConnected(): boolean {

@@ -1,9 +1,16 @@
 import { IncomingMessage, ServerResponse } from "http";
+import * as vscode from "vscode";
 import { FileManager } from "../sync/fileManager";
 import { ChangeQueue } from "../sync/changeQueue";
 import { FileWatcher } from "../sync/fileWatcher";
 import { SessionState, InstanceData, Change } from "../types";
 import { randomUUID } from "crypto";
+import * as syncLog from "../syncLog";
+import { UI } from "../ui/messages";
+
+/** Avoid spamming the banner on back-to-back full syncs (e.g. reconnect after editor reload). */
+let lastWorkspaceReadyBannerAt = 0;
+const WORKSPACE_READY_BANNER_DEBOUNCE_MS = 25000;
 
 export class RouteHandler {
   private session: SessionState = {
@@ -11,6 +18,9 @@ export class RouteHandler {
     sessionId: null,
     lastFullSync: null,
   };
+
+  private lastStudioLivenessAt = 0;
+  private inactivityTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private fileManager: FileManager,
@@ -38,6 +48,8 @@ export class RouteHandler {
     try {
       if (method === "GET" && url === "/api/status") {
         this.handleStatus(res);
+      } else if (method === "GET" && url === "/api/ping") {
+        this.handlePing(res);
       } else if (method === "POST" && url === "/api/connect") {
         await this.handleConnect(req, res);
       } else if (method === "POST" && url === "/api/disconnect") {
@@ -54,21 +66,68 @@ export class RouteHandler {
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error("[RobloxSync] Route error:", msg);
+      syncLog.errorLine(`request: ${msg}`);
       res.writeHead(500);
       res.end(JSON.stringify({ error: msg }));
     }
   }
 
   private handleStatus(res: ServerResponse): void {
+    const cfg = vscode.workspace.getConfiguration("robloxSync");
     res.writeHead(200);
     res.end(
       JSON.stringify({
         connected: this.session.connected,
         version: "0.1.0",
         sessionId: this.session.sessionId,
+        studioInactivityTimeoutSec: cfg.get<number>("studioInactivityTimeoutSec", 45),
+        studioPingIntervalSec: cfg.get<number>("studioPingIntervalSec", 8),
       })
     );
+  }
+
+  private handlePing(res: ServerResponse): void {
+    if (this.session.connected) {
+      this.touchStudioLiveness();
+    }
+    res.writeHead(200);
+    res.end(JSON.stringify({ ok: true, connected: this.session.connected }));
+  }
+
+  private touchStudioLiveness(): void {
+    this.lastStudioLivenessAt = Date.now();
+  }
+
+  private startStudioInactivityWatcher(): void {
+    this.stopStudioInactivityWatcher();
+    this.touchStudioLiveness();
+    this.inactivityTimer = setInterval(() => {
+      if (!this.session.connected) {
+        this.stopStudioInactivityWatcher();
+        return;
+      }
+      const cfg = vscode.workspace.getConfiguration("robloxSync");
+      const sec = Math.max(15, cfg.get<number>("studioInactivityTimeoutSec", 45));
+      if (Date.now() - this.lastStudioLivenessAt > sec * 1000) {
+        this.stopStudioInactivityWatcher();
+        this.session = {
+          connected: false,
+          sessionId: null,
+          lastFullSync: null,
+        };
+        const cb = this.onPluginDisconnected;
+        if (cb) {
+          setImmediate(() => cb());
+        }
+      }
+    }, 3000);
+  }
+
+  private stopStudioInactivityWatcher(): void {
+    if (this.inactivityTimer) {
+      clearInterval(this.inactivityTimer);
+      this.inactivityTimer = null;
+    }
   }
 
   private async handleConnect(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -92,7 +151,9 @@ export class RouteHandler {
     const experienceName = data.experienceName ?? placeName;
     const structureHash = data.structureHash ?? "";
 
-    console.log(`[RobloxSync] Plugin connected (v${data.version ?? "unknown"}) — ${experienceName} (${placeId || "unpublished"})`);
+    syncLog.connected(experienceName || placeName || String(placeId || "unpublished"));
+    this.touchStudioLiveness();
+    this.startStudioInactivityWatcher();
     this.onPluginConnected?.(placeId, placeName, experienceName, structureHash);
 
     res.writeHead(200);
@@ -105,32 +166,44 @@ export class RouteHandler {
   }
 
   private async handleDisconnect(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+    this.stopStudioInactivityWatcher();
     this.session = {
       connected: false,
       sessionId: null,
       lastFullSync: null,
     };
 
-    console.log("[RobloxSync] Plugin disconnected");
-    this.onPluginDisconnected?.();
-
     res.writeHead(200);
     res.end(JSON.stringify({ status: "disconnected" }));
+
+    const onDisconnect = this.onPluginDisconnected;
+    if (onDisconnect) {
+      setImmediate(() => onDisconnect());
+    }
   }
 
   private async handleFullSync(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = await readBody(req);
     const data = JSON.parse(body) as { tree: InstanceData[] };
 
+    if (this.session.connected) {
+      this.touchStudioLiveness();
+    }
+
     // Pause file watcher while writing to avoid echo
     this.fileWatcher.pause();
     try {
       await this.fileManager.writeFullTree(data.tree);
       this.session.lastFullSync = Date.now();
-      console.log(`[RobloxSync] Full sync complete — ${data.tree.length} services written`);
     } finally {
       // Small delay before resuming to let FS events settle
       setTimeout(() => this.fileWatcher.resume(), 500);
+    }
+
+    const now = Date.now();
+    if (now - lastWorkspaceReadyBannerAt >= WORKSPACE_READY_BANNER_DEBOUNCE_MS) {
+      lastWorkspaceReadyBannerAt = now;
+      void vscode.window.showInformationMessage(UI.workspaceReadyToEdit);
     }
 
     res.writeHead(200);
@@ -139,7 +212,11 @@ export class RouteHandler {
 
   private async handleStudioChanges(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = await readBody(req);
-    const data = JSON.parse(body) as { changes: Change[] };
+    const data = JSON.parse(body) as { changes: Change[]; silentLog?: boolean };
+
+    if (this.session.connected) {
+      this.touchStudioLiveness();
+    }
 
     this.fileWatcher.pause();
     let applied = 0;
@@ -147,10 +224,13 @@ export class RouteHandler {
       for (const change of data.changes) {
         try {
           await this.fileManager.applyStudioChange(change);
+          if (!data.silentLog) {
+            syncLog.change("Studio ---> VS Code", syncLog.formatChangeSummary(change));
+          }
           applied++;
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
-          console.error(`[RobloxSync] Failed to apply ${change.type} for ${change.instancePath}: ${msg}`);
+          syncLog.errorLine(`Studio ---> VS Code (${syncLog.formatChangeSummary(change)}): ${msg}`);
         }
       }
     } finally {
@@ -163,8 +243,12 @@ export class RouteHandler {
 
   private handleVscodeChanges(res: ServerResponse): void {
     const changes = this.changeQueue.drain();
+    for (const c of changes) {
+      syncLog.change("VS Code ---> Studio", syncLog.formatChangeSummary(c));
+    }
+    const cursorMode = vscode.workspace.getConfiguration("robloxSync").get<boolean>("cursorMode", false);
     res.writeHead(200);
-    res.end(JSON.stringify({ changes }));
+    res.end(JSON.stringify({ changes, cursorMode }));
   }
 
   isConnected(): boolean {

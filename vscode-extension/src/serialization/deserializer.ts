@@ -2,17 +2,31 @@ import * as fs from "fs";
 import * as path from "path";
 import { InstanceData, META_FILENAME, Change } from "../types";
 import { decodePropertyValue } from "./propertyTypes";
-import { getPropertyType, resolveClassName, isValidClassName } from "./apiDump";
+import { getPropertyType, resolveClassName, resolveClassFromFolderPrefix, getClass } from "./apiDump";
 import { InstanceMapper } from "../sync/instanceMapper";
 
 /**
  * Read a file event and convert it to a Change for the Roblox plugin.
  * In folder-only mode, only init.meta.json and init.*.lua are meaningful files.
  */
+function metaJsonHasClassName(metaPath: string): boolean {
+  if (!fs.existsSync(metaPath)) return false;
+  try {
+    const raw = fs.readFileSync(metaPath, "utf-8").trim();
+    if (!raw || raw === "{}" || raw === "{ }") return false;
+    const json = JSON.parse(raw) as { className?: unknown };
+    const cn = json.className;
+    return cn !== undefined && cn !== null && String(cn).trim() !== "";
+  } catch {
+    return false;
+  }
+}
+
 export function fileToChange(
   filePath: string,
   changeType: "create" | "update" | "delete",
-  mapper: InstanceMapper
+  mapper: InstanceMapper,
+  cursorMode = false
 ): Change | null {
   const parsed = mapper.filePathToInstance(filePath);
   if (!parsed) {
@@ -38,6 +52,9 @@ export function fileToChange(
   if (parsed.isScript) {
     // init.*.lua → read full properties from meta + Source from this file
     const metaPath = path.join(path.dirname(filePath), META_FILENAME);
+    if (cursorMode && !metaJsonHasClassName(metaPath)) {
+      return null;
+    }
     let className = parsed.className ?? "Script";
     let name = parsed.name;
     const properties: Record<string, unknown> = {};
@@ -46,9 +63,13 @@ export function fileToChange(
       try {
         const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
         if (meta.className) {
-          className = meta.className;
+          const resolved = resolveClassName(String(meta.className));
+          if (cursorMode && !getClass(resolved)) {
+            return null;
+          }
+          className = resolved;
         }
-        if (meta.name) {
+        if (meta.name && !cursorMode) {
           name = meta.name;
         }
         if (meta.properties) {
@@ -90,6 +111,9 @@ export function fileToChange(
     // init.meta.json → create/update the instance's properties
     const trimmed = content.trim();
     if (!trimmed || trimmed === "{}" || trimmed === "{ }") {
+      if (cursorMode) {
+        return null;
+      }
       return {
         type: changeType,
         instancePath,
@@ -105,9 +129,18 @@ export function fileToChange(
     }
 
     try {
-      const json = JSON.parse(content);
+      const json = JSON.parse(content) as { className?: unknown; name?: string; properties?: Record<string, unknown> };
+      if (cursorMode) {
+        const cn = json.className;
+        if (cn === undefined || cn === null || String(cn).trim() === "") {
+          return null;
+        }
+      }
       const className = resolveClassName(json.className ?? "Folder");
-      const name = json.name ?? parsed.name;
+      if (cursorMode && !getClass(className)) {
+        return null;
+      }
+      const name = cursorMode ? parsed.name : (json.name ?? parsed.name);
       const properties: Record<string, unknown> = {};
 
       if (json.properties) {
@@ -160,7 +193,8 @@ export function fileToChange(
  */
 export function directoryToInstanceData(
   dirPath: string,
-  mapper: InstanceMapper
+  mapper: InstanceMapper,
+  cursorMode = false
 ): InstanceData | null {
   const folderName = path.basename(dirPath);
   const metaPath = path.join(dirPath, META_FILENAME);
@@ -169,13 +203,41 @@ export function directoryToInstanceData(
   let name = folderName;
   let properties: Record<string, unknown> = {};
 
-  if (fs.existsSync(metaPath)) {
+  if (!fs.existsSync(metaPath)) {
+    if (cursorMode) {
+      return null;
+    }
+    const resolvedClass = resolveClassFromFolderPrefix(folderName);
+    if (resolvedClass) {
+      className = resolvedClass;
+      name = folderName;
+    }
+  } else {
     try {
       const raw = fs.readFileSync(metaPath, "utf-8").trim();
-      if (raw && raw !== "{}" && raw !== "{ }") {
-        const json = JSON.parse(raw);
+      if (!raw || raw === "{}" || raw === "{ }") {
+        if (cursorMode) {
+          return null;
+        }
+        const resolvedClass = resolveClassFromFolderPrefix(folderName);
+        if (resolvedClass) {
+          className = resolvedClass;
+          name = folderName;
+        }
+      } else {
+        const json = JSON.parse(raw) as { className?: unknown; name?: string; properties?: Record<string, unknown> };
+        if (cursorMode) {
+          const cn = json.className;
+          if (cn === undefined || cn === null || String(cn).trim() === "") {
+            return null;
+          }
+        }
         className = resolveClassName(json.className ?? "Folder");
-        if (json.name) {
+        if (cursorMode) {
+          if (!getClass(className)) {
+            return null;
+          }
+        } else if (json.name) {
           name = json.name;
         }
         if (json.properties) {
@@ -192,28 +254,16 @@ export function directoryToInstanceData(
             }
           }
         }
-      } else {
-        // Empty meta: use folder name as class if valid
-        const resolvedClass = isValidClassName(folderName);
-        if (resolvedClass) {
-          className = resolvedClass;
-          name = folderName;
-        }
       }
     } catch {
-      // Parse failed: use folder name as class if valid
-      const resolvedClass = isValidClassName(folderName);
+      if (cursorMode) {
+        return null;
+      }
+      const resolvedClass = resolveClassFromFolderPrefix(folderName);
       if (resolvedClass) {
         className = resolvedClass;
         name = folderName;
       }
-    }
-  } else {
-    // No meta file: use folder name as class if valid (creates object with defaults)
-    const resolvedClass = isValidClassName(folderName);
-    if (resolvedClass) {
-      className = resolvedClass;
-      name = folderName;
     }
   }
 
@@ -239,7 +289,7 @@ export function directoryToInstanceData(
         continue;
       }
       const childPath = path.join(dirPath, entry.name);
-      const child = directoryToInstanceData(childPath, mapper);
+      const child = directoryToInstanceData(childPath, mapper, cursorMode);
       if (child) {
         data.children.push(child);
       }

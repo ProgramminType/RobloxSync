@@ -90,3 +90,34 @@ export function isValidClassName(name: string): string | null {
   const resolved = resolveClassName(name);
   return classMap?.has(resolved) ? resolved : null;
 }
+
+let classNamesLongestFirst: string[] | null = null;
+
+function getClassNamesLongestFirst(): string[] {
+  if (classNamesLongestFirst) {
+    return classNamesLongestFirst;
+  }
+  if (!classMap) {
+    return [];
+  }
+  classNamesLongestFirst = Array.from(classMap.keys()).sort((a, b) => b.length - a.length);
+  return classNamesLongestFirst;
+}
+
+/**
+ * Non–cursor mode: folder name may be a class name or that class name + any suffix
+ * (e.g. Part, Part1, Part_4, PartFoo). Longest matching class wins (ParticleEmitter before Part).
+ */
+export function resolveClassFromFolderPrefix(folderName: string): string | null {
+  if (!folderName) {
+    return null;
+  }
+  const lower = folderName.toLowerCase();
+  for (const c of getClassNamesLongestFirst()) {
+    const cl = c.toLowerCase();
+    if (lower.startsWith(cl)) {
+      return c;
+    }
+  }
+  return null;
+}

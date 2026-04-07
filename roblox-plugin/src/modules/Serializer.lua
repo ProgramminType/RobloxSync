@@ -34,6 +34,20 @@ local function getPropertyList(className)
 	return props
 end
 
+--- Dot path from game child through instance (e.g. Workspace.Part), matching VS Code folder paths.
+function Serializer.getInstanceDotPath(instance)
+	if not instance then
+		return "?"
+	end
+	local segments = {}
+	local current = instance
+	while current and current ~= game do
+		table.insert(segments, 1, current.Name)
+		current = current.Parent
+	end
+	return table.concat(segments, ".")
+end
+
 function Serializer.serializeInstance(instance)
 	if Config.NON_SERIALIZABLE_CLASSES[instance.ClassName] then
 		return nil
@@ -79,7 +93,7 @@ function Serializer.serializeInstance(instance)
 
 		for _, child in ipairs(instance:GetChildren()) do
 			if nameCounts[child.Name] and nameCounts[child.Name] > 1 then
-				warn("[RobloxSync] Skipping pre-existing duplicate: " .. child:GetFullName())
+				warn("[Roblox Sync] error: skipping duplicate " .. child:GetFullName())
 			else
 				local childData = Serializer.serializeInstance(child)
 				if childData then
@@ -113,7 +127,7 @@ end
 function Serializer.serializeChange(changeType, instance, property, oldValue)
 	local change = {
 		type = changeType,
-		instancePath = instance:GetFullName(),
+		instancePath = Serializer.getInstanceDotPath(instance),
 		timestamp = os.clock(),
 	}
 

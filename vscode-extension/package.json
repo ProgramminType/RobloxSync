@@ -10,27 +10,46 @@
     "vscode": "^1.85.0"
   },
   "categories": ["Other"],
-  "activationEvents": ["workspaceContains:**/.roblox-sync-workspace", "onCommand:robloxSync.connect"],
+  "activationEvents": [
+    "onStartupFinished",
+    "workspaceContains:**/.roblox-sync-workspace",
+    "onCommand:robloxSync.connect",
+    "onCommand:robloxSync.turnOnCursorMode",
+    "onCommand:robloxSync.turnOffCursorMode",
+    "onCommand:robloxSync.installPlugin"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
         "command": "robloxSync.connect",
-        "title": "Roblox Sync: Start Server"
-      },
-      {
-        "command": "robloxSync.disconnect",
-        "title": "Roblox Sync: Stop Server"
+        "title": "Roblox Sync: Connect to Studio"
       },
       {
         "command": "robloxSync.installPlugin",
         "title": "Roblox Sync: Install Studio Plugin"
       },
       {
-        "command": "robloxSync.fullSync",
-        "title": "Roblox Sync: Request Full Sync"
+        "command": "robloxSync.turnOnCursorMode",
+        "title": "Roblox Sync: Enable Cursor Mode"
+      },
+      {
+        "command": "robloxSync.turnOffCursorMode",
+        "title": "Roblox Sync: Disable Cursor Mode"
       }
     ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "robloxSync.turnOnCursorMode",
+          "when": "!robloxSync.cursorModeOn"
+        },
+        {
+          "command": "robloxSync.turnOffCursorMode",
+          "when": "robloxSync.cursorModeOn"
+        }
+      ]
+    },
     "configuration": {
       "title": "Roblox Sync",
       "properties": {
@@ -48,6 +67,25 @@
           "type": "number",
           "default": 0.3,
           "description": "How often the plugin polls for changes (seconds)"
+        },
+        "robloxSync.cursorMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "When on, only sync new instances after init.meta.json includes className; folder name is the instance name, not the Roblox class. When off, a folder named like a class (e.g. Part) creates that instance with defaults immediately."
+        },
+        "robloxSync.studioInactivityTimeoutSec": {
+          "type": "number",
+          "default": 45,
+          "minimum": 15,
+          "maximum": 600,
+          "description": "While Studio is connected, stop the sync server if there is no Studio ping or studio-changes traffic for this many seconds (e.g. Studio closed or stuck)."
+        },
+        "robloxSync.studioPingIntervalSec": {
+          "type": "number",
+          "default": 8,
+          "minimum": 3,
+          "maximum": 30,
+          "description": "How often the Studio plugin should call /api/ping while connected (advertised via /api/status)."
         }
       }
     }

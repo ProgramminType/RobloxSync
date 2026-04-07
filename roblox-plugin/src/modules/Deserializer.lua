@@ -1,9 +1,25 @@
 local Config = require(script.Parent.Config)
 local PropertyHandler = require(script.Parent.PropertyHandler)
+local PropertyDatabase = require(script.Parent.PropertyDatabase)
 
 local Deserializer = {}
 
+local function normalizeInstancePath(pathStr)
+	if not pathStr or pathStr == "" then
+		return pathStr
+	end
+	local parts = string.split(pathStr, ".")
+	if #parts > 0 then
+		local first = parts[1]
+		if string.lower(first) == "game" then
+			table.remove(parts, 1)
+		end
+	end
+	return table.concat(parts, ".")
+end
+
 local function resolveInstancePath(path)
+	path = normalizeInstancePath(path)
 	local parts = string.split(path, ".")
 	if #parts == 0 then
 		return nil
@@ -21,6 +37,7 @@ local function resolveInstancePath(path)
 end
 
 local function getParentFromPath(path)
+	path = normalizeInstancePath(path)
 	local parts = string.split(path, ".")
 	if #parts <= 1 then
 		return nil, nil
@@ -41,6 +58,47 @@ local SCRIPT_CLASSES = {
 	LocalScript = true,
 	ModuleScript = true,
 }
+
+local function propertyExistsForClass(className, propName)
+	if propName == "Name" then
+		return true
+	end
+	local current = className
+	while current do
+		local entry = PropertyDatabase.data[current]
+		if not entry then
+			break
+		end
+		for _, p in ipairs(entry.props) do
+			if p == propName then
+				return true
+			end
+		end
+		current = entry.super
+	end
+	return false
+end
+
+-- Every property in the payload must exist on target class (Source only allowed for scripts)
+local function propertiesValidForTargetClass(properties, targetClassName)
+	if not properties then
+		return true
+	end
+	for propName, _ in pairs(properties) do
+		if propName ~= "Name" then
+			if propName == "Source" then
+				if not SCRIPT_CLASSES[targetClassName] then
+					return false
+				end
+			else
+				if not propertyExistsForClass(targetClassName, propName) then
+					return false
+				end
+			end
+		end
+	end
+	return true
+end
 
 -- Convert a raw JSON value to the correct Roblox type by inspecting
 -- the instance's current property type or the value format
@@ -197,7 +255,7 @@ local function setProperty(instance, propName, rawValue)
 		(instance :: any)[propName] = converted
 	end)
 	if not success then
-		warn("[RobloxSync] Failed to set " .. propName .. " on " .. instance:GetFullName() .. ": " .. tostring(err))
+		warn("[Roblox Sync] error: set " .. propName .. " on " .. instance:GetFullName() .. ": " .. tostring(err))
 	end
 end
 
@@ -215,7 +273,7 @@ end
 
 function Deserializer.createInstance(change)
 	if not change.instanceData then
-		warn("[RobloxSync] Create change missing instanceData")
+		warn("[Roblox Sync] error: create change missing instanceData")
 		return
 	end
 
@@ -232,7 +290,7 @@ function Deserializer.createInstance(change)
 
 	local parent, _ = getParentFromPath(change.instancePath)
 	if not parent then
-		warn("[RobloxSync] Could not find parent for: " .. change.instancePath)
+		warn("[Roblox Sync] error: no parent for " .. change.instancePath)
 		return
 	end
 
@@ -245,17 +303,17 @@ function Deserializer.buildInstanceTree(data, parent)
 	end)
 
 	if not success then
-		warn("[RobloxSync] Could not create instance of class: " .. data.className)
+		warn("[Roblox Sync] error: cannot create class " .. data.className)
 		return nil
 	end
 
 	instance.Name = data.name
 
-	for propName, propValue in pairs(data.properties) do
+	for propName, propValue in pairs(data.properties or {}) do
 		setProperty(instance, propName, propValue)
 	end
 
-	for _, childData in ipairs(data.children) do
+	for _, childData in ipairs(data.children or {}) do
 		Deserializer.buildInstanceTree(childData, instance)
 	end
 
@@ -266,27 +324,56 @@ end
 function Deserializer.updateInstance(change)
 	local instance = resolveInstancePath(change.instancePath)
 	if not instance then
-		warn("[RobloxSync] Could not find instance: " .. change.instancePath)
+		-- VS Code often sends "update" when saving init.meta.json even if Studio has no instance yet
+		-- (e.g. cursor mode: folder first, meta added later). Treat as create.
+		if change.instanceData then
+			Deserializer.createInstance(change)
+		end
 		return
 	end
 
 	if change.instanceData and change.instanceData.className and change.instanceData.className ~= instance.ClassName then
-		-- className changed: convert object (destroy old, create new with same name, default properties)
+		local newClass = change.instanceData.className
+		if Config.CURSOR_MODE then
+			if not propertiesValidForTargetClass(change.instanceData.properties, newClass) then
+				warn(
+					"[Roblox Sync] error: Cursor mode — class change to "
+						.. newClass
+						.. " deferred; remove properties from init.meta.json that are not valid for that class."
+				)
+				if change.instanceData.properties then
+					for propName, propValue in pairs(change.instanceData.properties) do
+						local ok = propertyExistsForClass(instance.ClassName, propName)
+							or (propName == "Source" and SCRIPT_CLASSES[instance.ClassName])
+						if ok then
+							setProperty(instance, propName, propValue)
+						end
+					end
+				end
+				return
+			end
+		end
+
+		-- className changed: convert object (destroy old, create new with same name)
 		local parent = instance.Parent
 		local preservedName = instance.Name
 		instance:Destroy()
 
-		local newClass = change.instanceData.className
 		local success, newInstance = pcall(function()
 			return Instance.new(newClass)
 		end)
 		if not success then
-			warn("[RobloxSync] Could not convert to class: " .. newClass)
+			warn("[Roblox Sync] error: cannot convert to class " .. newClass)
 			return
 		end
 
 		newInstance.Name = preservedName
 		newInstance.Parent = parent
+		if change.instanceData.properties then
+			for propName, propValue in pairs(change.instanceData.properties) do
+				setProperty(newInstance, propName, propValue)
+			end
+		end
 		return
 	end
 
@@ -313,6 +400,11 @@ function Deserializer.renameInstance(change)
 	if instance and change.newName then
 		instance.Name = change.newName
 	end
+end
+
+--- Resolve a dot path (e.g. Workspace.Part) to an Instance, for post-apply serialization.
+function Deserializer.resolveInstancePath(pathStr)
+	return resolveInstancePath(pathStr)
 end
 
 return Deserializer

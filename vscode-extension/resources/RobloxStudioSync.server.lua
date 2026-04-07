@@ -896,6 +896,9 @@ end
 _modules["Config"] = function()
 local Config = {}
 
+-- Set from VS Code poll response; defers risky class conversions in cursor mode
+Config.CURSOR_MODE = false
+
 -- Icon asset IDs for toolbar buttons (connect.png and disconnect.png uploaded to Roblox)
 Config.CONNECT_ICON = "rbxassetid://70940333195048"
 Config.DISCONNECT_ICON = "rbxassetid://112124618127933"
@@ -903,6 +906,8 @@ Config.DISCONNECT_ICON = "rbxassetid://112124618127933"
 Config.PORT = 34872
 Config.HOST = "http://127.0.0.1"
 Config.POLL_INTERVAL = 0.3
+-- How often to hit /api/ping while connected (server may suggest a value via /api/status).
+Config.STUDIO_PING_INTERVAL = 8
 Config.DEBOUNCE_TIME = 0.2
 
 Config.SYNCED_SERVICES = {
@@ -1149,12 +1154,7 @@ local UI = {}
 local StarterGui = game:GetService("StarterGui")
 
 function UI.showNotification(text, isWarning)
-	if isWarning then
-		warn("[RobloxSync] " .. text)
-	else
-		print("[RobloxSync] " .. text)
-	end
-
+	-- Output logging is handled in init.server.lua (consistent [Roblox Sync] lines).
 	pcall(function()
 		StarterGui:SetCore("SendNotification", {
 			Title = "Roblox Studio Sync",
@@ -1248,6 +1248,20 @@ local function getPropertyList(className)
 	return props
 end
 
+--- Dot path from game child through instance (e.g. Workspace.Part), matching VS Code folder paths.
+function Serializer.getInstanceDotPath(instance)
+	if not instance then
+		return "?"
+	end
+	local segments = {}
+	local current = instance
+	while current and current ~= game do
+		table.insert(segments, 1, current.Name)
+		current = current.Parent
+	end
+	return table.concat(segments, ".")
+end
+
 function Serializer.serializeInstance(instance)
 	if Config.NON_SERIALIZABLE_CLASSES[instance.ClassName] then
 		return nil
@@ -1293,7 +1307,7 @@ function Serializer.serializeInstance(instance)
 
 		for _, child in ipairs(instance:GetChildren()) do
 			if nameCounts[child.Name] and nameCounts[child.Name] > 1 then
-				warn("[RobloxSync] Skipping pre-existing duplicate: " .. child:GetFullName())
+				warn("[Roblox Sync] error: skipping duplicate " .. child:GetFullName())
 			else
 				local childData = Serializer.serializeInstance(child)
 				if childData then
@@ -1327,7 +1341,7 @@ end
 function Serializer.serializeChange(changeType, instance, property, oldValue)
 	local change = {
 		type = changeType,
-		instancePath = instance:GetFullName(),
+		instancePath = Serializer.getInstanceDotPath(instance),
 		timestamp = os.clock(),
 	}
 
@@ -1355,10 +1369,26 @@ end
 _modules["Deserializer"] = function()
 local Config = _require("Config")
 local PropertyHandler = _require("PropertyHandler")
+local PropertyDatabase = _require("PropertyDatabase")
 
 local Deserializer = {}
 
+local function normalizeInstancePath(pathStr)
+	if not pathStr or pathStr == "" then
+		return pathStr
+	end
+	local parts = string.split(pathStr, ".")
+	if #parts > 0 then
+		local first = parts[1]
+		if string.lower(first) == "game" then
+			table.remove(parts, 1)
+		end
+	end
+	return table.concat(parts, ".")
+end
+
 local function resolveInstancePath(path)
+	path = normalizeInstancePath(path)
 	local parts = string.split(path, ".")
 	if #parts == 0 then
 		return nil
@@ -1376,6 +1406,7 @@ local function resolveInstancePath(path)
 end
 
 local function getParentFromPath(path)
+	path = normalizeInstancePath(path)
 	local parts = string.split(path, ".")
 	if #parts <= 1 then
 		return nil, nil
@@ -1396,6 +1427,47 @@ local SCRIPT_CLASSES = {
 	LocalScript = true,
 	ModuleScript = true,
 }
+
+local function propertyExistsForClass(className, propName)
+	if propName == "Name" then
+		return true
+	end
+	local current = className
+	while current do
+		local entry = PropertyDatabase.data[current]
+		if not entry then
+			break
+		end
+		for _, p in ipairs(entry.props) do
+			if p == propName then
+				return true
+			end
+		end
+		current = entry.super
+	end
+	return false
+end
+
+-- Every property in the payload must exist on target class (Source only allowed for scripts)
+local function propertiesValidForTargetClass(properties, targetClassName)
+	if not properties then
+		return true
+	end
+	for propName, _ in pairs(properties) do
+		if propName ~= "Name" then
+			if propName == "Source" then
+				if not SCRIPT_CLASSES[targetClassName] then
+					return false
+				end
+			else
+				if not propertyExistsForClass(targetClassName, propName) then
+					return false
+				end
+			end
+		end
+	end
+	return true
+end
 
 -- Convert a raw JSON value to the correct Roblox type by inspecting
 -- the instance's current property type or the value format
@@ -1552,7 +1624,7 @@ local function setProperty(instance, propName, rawValue)
 		(instance :: any)[propName] = converted
 	end)
 	if not success then
-		warn("[RobloxSync] Failed to set " .. propName .. " on " .. instance:GetFullName() .. ": " .. tostring(err))
+		warn("[Roblox Sync] error: set " .. propName .. " on " .. instance:GetFullName() .. ": " .. tostring(err))
 	end
 end
 
@@ -1570,7 +1642,7 @@ end
 
 function Deserializer.createInstance(change)
 	if not change.instanceData then
-		warn("[RobloxSync] Create change missing instanceData")
+		warn("[Roblox Sync] error: create change missing instanceData")
 		return
 	end
 
@@ -1587,7 +1659,7 @@ function Deserializer.createInstance(change)
 
 	local parent, _ = getParentFromPath(change.instancePath)
 	if not parent then
-		warn("[RobloxSync] Could not find parent for: " .. change.instancePath)
+		warn("[Roblox Sync] error: no parent for " .. change.instancePath)
 		return
 	end
 
@@ -1600,17 +1672,17 @@ function Deserializer.buildInstanceTree(data, parent)
 	end)
 
 	if not success then
-		warn("[RobloxSync] Could not create instance of class: " .. data.className)
+		warn("[Roblox Sync] error: cannot create class " .. data.className)
 		return nil
 	end
 
 	instance.Name = data.name
 
-	for propName, propValue in pairs(data.properties) do
+	for propName, propValue in pairs(data.properties or {}) do
 		setProperty(instance, propName, propValue)
 	end
 
-	for _, childData in ipairs(data.children) do
+	for _, childData in ipairs(data.children or {}) do
 		Deserializer.buildInstanceTree(childData, instance)
 	end
 
@@ -1621,27 +1693,56 @@ end
 function Deserializer.updateInstance(change)
 	local instance = resolveInstancePath(change.instancePath)
 	if not instance then
-		warn("[RobloxSync] Could not find instance: " .. change.instancePath)
+		-- VS Code often sends "update" when saving init.meta.json even if Studio has no instance yet
+		-- (e.g. cursor mode: folder first, meta added later). Treat as create.
+		if change.instanceData then
+			Deserializer.createInstance(change)
+		end
 		return
 	end
 
 	if change.instanceData and change.instanceData.className and change.instanceData.className ~= instance.ClassName then
-		-- className changed: convert object (destroy old, create new with same name, default properties)
+		local newClass = change.instanceData.className
+		if Config.CURSOR_MODE then
+			if not propertiesValidForTargetClass(change.instanceData.properties, newClass) then
+				warn(
+					"[Roblox Sync] error: Cursor mode — class change to "
+						.. newClass
+						.. " deferred; remove properties from init.meta.json that are not valid for that class."
+				)
+				if change.instanceData.properties then
+					for propName, propValue in pairs(change.instanceData.properties) do
+						local ok = propertyExistsForClass(instance.ClassName, propName)
+							or (propName == "Source" and SCRIPT_CLASSES[instance.ClassName])
+						if ok then
+							setProperty(instance, propName, propValue)
+						end
+					end
+				end
+				return
+			end
+		end
+
+		-- className changed: convert object (destroy old, create new with same name)
 		local parent = instance.Parent
 		local preservedName = instance.Name
 		instance:Destroy()
 
-		local newClass = change.instanceData.className
 		local success, newInstance = pcall(function()
 			return Instance.new(newClass)
 		end)
 		if not success then
-			warn("[RobloxSync] Could not convert to class: " .. newClass)
+			warn("[Roblox Sync] error: cannot convert to class " .. newClass)
 			return
 		end
 
 		newInstance.Name = preservedName
 		newInstance.Parent = parent
+		if change.instanceData.properties then
+			for propName, propValue in pairs(change.instanceData.properties) do
+				setProperty(newInstance, propName, propValue)
+			end
+		end
 		return
 	end
 
@@ -1670,6 +1771,11 @@ function Deserializer.renameInstance(change)
 	end
 end
 
+--- Resolve a dot path (e.g. Workspace.Part) to an Instance, for post-apply serialization.
+function Deserializer.resolveInstancePath(pathStr)
+	return resolveInstancePath(pathStr)
+end
+
 return Deserializer
 
 end
@@ -1677,6 +1783,13 @@ end
 _modules["ChangeDetector"] = function()
 local Config = _require("Config")
 local Serializer = _require("Serializer")
+
+-- New scripts from Studio get empty Source so sync matches VS Code (no default template race).
+local SCRIPT_CLASS_NAMES = {
+	Script = true,
+	LocalScript = true,
+	ModuleScript = true,
+}
 
 local ChangeDetector = {}
 ChangeDetector.__index = ChangeDetector
@@ -1690,6 +1803,8 @@ function ChangeDetector.new()
 	self._pendingUpdates = {}
 	-- When true, property changes are ignored (used while applying VS Code changes)
 	self._suppressed = false
+	-- Ignore Source Changed while clearing new scripts' Source (defers create); avoids orphan updates before create flushes
+	self._ignoreSourceUpdatesFor = {}
 	return self
 end
 
@@ -1718,7 +1833,7 @@ function ChangeDetector:startTracking()
 		end
 
 		local addedConn = service.DescendantAdded:Connect(function(descendant)
-			if not self._tracking then
+			if not self._tracking or self._suppressed then
 				return
 			end
 
@@ -1754,19 +1869,51 @@ function ChangeDetector:startTracking()
 
 			self:_trackInstance(descendant)
 
-			local change = Serializer.serializeChange("create", descendant)
-			table.insert(self._structureChanges, change)
+			if SCRIPT_CLASS_NAMES[descendant.ClassName] then
+				task.defer(function()
+					if not self._tracking or self._suppressed then
+						return
+					end
+					if descendant.Parent == nil then
+						return
+					end
+					-- Suppress Source Changed so we don't enqueue a property-only update before the deferred create flushes
+					local sid = tostring(descendant:GetDebugId())
+					self._ignoreSourceUpdatesFor[sid] = true
+					pcall(function()
+						descendant.Source = ""
+					end)
+					self._ignoreSourceUpdatesFor[sid] = nil
+					if not self._tracking or self._suppressed or descendant.Parent == nil then
+						return
+					end
+					local change = Serializer.serializeChange("create", descendant)
+					table.insert(self._structureChanges, change)
+				end)
+			else
+				local change = Serializer.serializeChange("create", descendant)
+				table.insert(self._structureChanges, change)
+			end
 		end)
 		table.insert(self._connections, addedConn)
 
 		local removingConn = service.DescendantRemoving:Connect(function(descendant)
-			if not self._tracking then
+			if not self._tracking or self._suppressed then
 				return
 			end
 
 			local cachedPath = self._pathCache[descendant]
 			if not cachedPath then
-				cachedPath = descendant:GetFullName()
+				cachedPath = Serializer.getInstanceDotPath(descendant)
+			end
+			-- Removing may run with Parent already cleared; single-segment paths are unreliable.
+			if type(cachedPath) == "string" and not string.find(cachedPath, ".", 1, true) then
+				local ok, full = pcall(function()
+					return descendant:GetFullName()
+				end)
+				if ok and type(full) == "string" and string.find(full, ".", 1, true) then
+					cachedPath = full
+				end
 			end
 
 			self:_untrackInstance(descendant)
@@ -1791,6 +1938,25 @@ function ChangeDetector:stopTracking()
 	self._pathCache = {}
 	self._pendingUpdates = {}
 	self._structureChanges = {}
+	self._ignoreSourceUpdatesFor = {}
+end
+
+--- Instances parented while _suppressed never got DescendantAdded handling; register them so deletes use full paths.
+function ChangeDetector:catchUpUntrackedDescendants()
+	if not self._tracking then
+		return
+	end
+	for _, serviceName in ipairs(Config.SYNCED_SERVICES) do
+		local service = game:FindService(serviceName)
+		if not service then
+			continue
+		end
+		for _, descendant in ipairs(service:GetDescendants()) do
+			if self._pathCache[descendant] == nil then
+				self:_trackInstance(descendant)
+			end
+		end
+	end
 end
 
 function ChangeDetector:flushChanges()
@@ -1810,12 +1976,20 @@ function ChangeDetector:_trackInstance(instance)
 		return
 	end
 
-	self._pathCache[instance] = instance:GetFullName()
+	if self._pathCache[instance] ~= nil then
+		return
+	end
+
+	self._pathCache[instance] = Serializer.getInstanceDotPath(instance)
 
 	local instanceId = tostring(instance:GetDebugId())
 
 	local conn = instance.Changed:Connect(function(property)
 		if not self._tracking or self._suppressed then
+			return
+		end
+
+		if property == "Source" and self._ignoreSourceUpdatesFor[instanceId] then
 			return
 		end
 
@@ -1855,7 +2029,7 @@ function ChangeDetector:_trackInstance(instance)
 			local oldPath = self._pathCache[instance]
 			local finalName = instance.Name
 			if instance.Parent then
-				self._pathCache[instance] = instance:GetFullName()
+				self._pathCache[instance] = Serializer.getInstanceDotPath(instance)
 			end
 			if oldPath then
 				local change = {
@@ -1874,7 +2048,7 @@ function ChangeDetector:_trackInstance(instance)
 		if property == "Parent" then
 			local oldPath = self._pathCache[instance]
 			if instance.Parent then
-				self._pathCache[instance] = instance:GetFullName()
+				self._pathCache[instance] = Serializer.getInstanceDotPath(instance)
 				if oldPath then
 					local deleteChange = {
 						type = "delete",
@@ -1913,40 +2087,133 @@ end
 do
 local Config = _require("Config")
 
-local toolbar = plugin:CreateToolbar("Roblox Sync")
-local connectButton = toolbar:CreateButton(
-	"Connect",
-	"Connect to Roblox Sync server",
-	Config.CONNECT_ICON
-)
-local disconnectButton = toolbar:CreateButton(
-	"Disconnect",
-	"Disconnect from Roblox Sync server",
-	Config.DISCONNECT_ICON
-)
-local HttpClient = _require("HttpClient")
 local Serializer = _require("Serializer")
 local Deserializer = _require("Deserializer")
 local ChangeDetector = _require("ChangeDetector")
-local PropertyHandler = _require("PropertyHandler")
 local UI = _require("UI")
 
 local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+
+-- DescendantAdded (and script follow-up) can run deferred; keep suppression through a few frames
+-- so echoed creates are not flushed on the next poll as Studio ---> VS Code.
+local HEARTBEATS_BEFORE_UNSUPPRESS = 3
 
 local connected = false
 local polling = false
+local pingAlive = false
 local sessionId = nil
 local changeDetector = nil
+local watcherAlive = true
+-- After a successful full sync; used to hide disconnect/poll noise during the brief VS Code reload window.
+local lastFullySyncedAt = 0
+local HANDOFF_GRACE_SEC = 8
+-- Suppress duplicate "Connecting" / "Connected" Studio output when VS Code reloads and we reconnect (~10–30s later).
+local lastStudioConnectBannerAt = 0
+local STUDIO_CONNECT_BANNER_COOLDOWN_SEC = 90
+-- Paths for which we echoed an Update after a VS Code create; filter duplicate ChangeDetector creates (incl. deferred scripts).
+local suppressedVscodeCreatePaths = {}
+
+local function withinHandoffGrace(): boolean
+	return (os.clock() - lastFullySyncedAt) < HANDOFF_GRACE_SEC
+end
 
 local function getBaseUrl()
 	return Config.HOST .. ":" .. tostring(Config.PORT) .. "/api"
 end
 
-local function checkHttpEnabled()
-	local success = pcall(function()
-		HttpService:GetAsync(getBaseUrl() .. "/status")
-	end)
-	return success
+local LOG_PREFIX = "[Roblox Sync]"
+
+local function logLine(msg)
+	print(LOG_PREFIX .. " " .. msg)
+end
+
+local function actionLabel(t)
+	local m = {
+		create = "Create",
+		delete = "Delete",
+		update = "Update",
+		rename = "Rename",
+	}
+	if type(t) == "string" and m[t] then
+		return m[t]
+	end
+	if type(t) == "string" and #t > 0 then
+		return t:sub(1, 1):upper() .. t:sub(2)
+	end
+	return "?"
+end
+
+local function formatChangeSummary(change)
+	local p = change.instancePath or "?"
+	local act = actionLabel(change.type)
+	if change.type == "rename" and change.oldName and change.newName then
+		return string.format("%s %s (%s -> %s)", act, p, change.oldName, change.newName)
+	end
+	-- Updates: instance path only; ".Property" looks like hierarchy (e.g. LocalScript.Source).
+	return string.format("%s %s", act, p)
+end
+
+local function filterFlushCreates(studioChanges, suppressed)
+	if not studioChanges or #studioChanges == 0 then
+		return studioChanges
+	end
+	if not suppressed or next(suppressed) == nil then
+		return studioChanges
+	end
+	local out = {}
+	for _, c in ipairs(studioChanges) do
+		if not (c.type == "create" and suppressed[c.instancePath]) then
+			table.insert(out, c)
+		end
+	end
+	return out
+end
+
+--- Strip leading "game." for path matching (VS Code paths omit it).
+local function normalizeInstancePathKey(p)
+	if type(p) ~= "string" or p == "" then
+		return nil
+	end
+	if string.sub(p, 1, 5) == "game." then
+		return string.sub(p, 6)
+	end
+	return p
+end
+
+--- Same poll batch can include create (full snapshot) plus Changed updates for defaults (Source, Enabled, …). Drop redundant property-only updates.
+local function dedupeUpdatesShadowedByCreatesInBatch(studioChanges)
+	if not studioChanges or #studioChanges == 0 then
+		return studioChanges
+	end
+	local created = {}
+	for _, c in ipairs(studioChanges) do
+		if c.type == "create" and type(c.instancePath) == "string" then
+			created[c.instancePath] = true
+			local n = normalizeInstancePathKey(c.instancePath)
+			if n then
+				created[n] = true
+			end
+		end
+	end
+	if next(created) == nil then
+		return studioChanges
+	end
+	local out = {}
+	for _, c in ipairs(studioChanges) do
+		local drop = false
+		if c.type == "update" and type(c.instancePath) == "string" and not c.instanceData then
+			local p = c.instancePath
+			local n = normalizeInstancePathKey(p)
+			if created[p] or (n and created[n]) then
+				drop = true
+			end
+		end
+		if not drop then
+			table.insert(out, c)
+		end
+	end
+	return out
 end
 
 local function doFullSync()
@@ -1968,53 +2235,104 @@ local function doFullSync()
 	end)
 
 	if not success then
-		warn("[RobloxSync] Full sync failed: " .. tostring(err))
+		warn(LOG_PREFIX .. " error: full sync failed: " .. tostring(err))
 		return false
 	end
 	return true
 end
 
+--- @param silentLog boolean if true, omit output (used for VS Code create echo — user already saw VS Code ---> Studio).
+local function sendStudioChanges(changes, silentLog)
+	if #changes == 0 then
+		return
+	end
+
+	local url = getBaseUrl() .. "/studio-changes"
+	if not silentLog then
+		for _, change in ipairs(changes) do
+			logLine("Studio ---> VS Code: " .. formatChangeSummary(change))
+		end
+	end
+
+	local payload = { changes = changes }
+	if silentLog then
+		payload.silentLog = true
+	end
+	local body = HttpService:JSONEncode(payload)
+	local success, err = pcall(function()
+		HttpService:PostAsync(url, body, Enum.HttpContentType.ApplicationJson)
+	end)
+	if not success then
+		warn(LOG_PREFIX .. " error: failed to send changes: " .. tostring(err))
+	end
+end
+
 local function pollForChanges()
+	local pollUrl = getBaseUrl() .. "/vscode-changes"
 	local success, response = pcall(function()
-		return HttpService:GetAsync(getBaseUrl() .. "/vscode-changes", true)
+		return HttpService:GetAsync(pollUrl, true)
 	end)
 
 	if not success then
+		-- Normal when the VS Code server stops; avoid spam during disconnect (ConnectFail, etc.).
 		return nil
 	end
 
 	local data = HttpService:JSONDecode(response)
+	if data and data.cursorMode ~= nil then
+		Config.CURSOR_MODE = data.cursorMode == true
+	end
 	if data and data.changes and #data.changes > 0 then
 		if changeDetector then
 			changeDetector:suppress()
 		end
 		for _, change in ipairs(data.changes) do
+			-- Free this path for new Studio instances after VS Code delete/rename (see filterFlushCreates).
+			if change.type == "delete" and type(change.instancePath) == "string" then
+				suppressedVscodeCreatePaths[change.instancePath] = nil
+			elseif change.type == "rename" and type(change.instancePath) == "string" then
+				suppressedVscodeCreatePaths[change.instancePath] = nil
+			end
+			logLine("VS Code ---> Studio: " .. formatChangeSummary(change))
 			Deserializer.applyChange(change)
 		end
+		-- Non–cursor mode: echo full instance snapshot from Studio (engine defaults) so VS Code can write init.meta.json + scripts.
+		if not Config.CURSOR_MODE then
+			local echoChanges = {}
+			for _, change in ipairs(data.changes) do
+				if change.type == "create" then
+					local inst = Deserializer.resolveInstancePath(change.instancePath)
+					if inst then
+						local dotPath = Serializer.getInstanceDotPath(inst)
+						suppressedVscodeCreatePaths[dotPath] = true
+						suppressedVscodeCreatePaths[change.instancePath] = true
+						local full = Serializer.serializeInstance(inst)
+						if full then
+							table.insert(echoChanges, {
+								type = "update",
+								instancePath = dotPath,
+								instanceData = full,
+								timestamp = os.clock(),
+							})
+						end
+					end
+				end
+			end
+			if #echoChanges > 0 then
+				sendStudioChanges(echoChanges, true)
+			end
+		end
 		if changeDetector then
+			-- Instances created while suppressed never hit DescendantAdded; register paths for correct delete/rename paths.
+			changeDetector:catchUpUntrackedDescendants()
+			for _ = 1, HEARTBEATS_BEFORE_UNSUPPRESS do
+				RunService.Heartbeat:Wait()
+			end
 			changeDetector:unsuppress()
 		end
 	end
 
 	return data
-end
-
-local function sendStudioChanges(changes)
-	if #changes == 0 then
-		return
-	end
-
-	for _, change in ipairs(changes) do
-		print("[RobloxSync] Sending " .. change.type .. ": " .. (change.instancePath or "?"))
-	end
-
-	local body = HttpService:JSONEncode({ changes = changes })
-	local success, err = pcall(function()
-		HttpService:PostAsync(getBaseUrl() .. "/studio-changes", body, Enum.HttpContentType.ApplicationJson)
-	end)
-	if not success then
-		warn("[RobloxSync] Failed to send changes: " .. tostring(err))
-	end
 end
 
 local function startPolling()
@@ -2024,7 +2342,8 @@ local function startPolling()
 			pollForChanges()
 
 			if changeDetector then
-				local studioChanges = changeDetector:flushChanges()
+				local studioChanges = filterFlushCreates(changeDetector:flushChanges(), suppressedVscodeCreatePaths)
+				studioChanges = dedupeUpdatesShadowedByCreatesInBatch(studioChanges)
 				if #studioChanges > 0 then
 					sendStudioChanges(studioChanges)
 				end
@@ -2039,7 +2358,71 @@ local function stopPolling()
 	polling = false
 end
 
-local function connect()
+local function stopPingLoop()
+	pingAlive = false
+end
+
+--- @param silent boolean if true, omit user-visible errors for failed connect (background retries)
+--- @param quietLog boolean if true, omit the disconnect print (workspace reload / session reset handoff)
+local function disconnect(silent, quietLog)
+	stopPingLoop()
+	if not connected then
+		stopPolling()
+		if changeDetector then
+			changeDetector:stopTracking()
+			changeDetector = nil
+		end
+		return
+	end
+
+	stopPolling()
+
+	if changeDetector then
+		changeDetector:stopTracking()
+		changeDetector = nil
+	end
+
+	pcall(function()
+		HttpService:PostAsync(
+			getBaseUrl() .. "/disconnect",
+			HttpService:JSONEncode({ sessionId = sessionId }),
+			Enum.HttpContentType.ApplicationJson
+		)
+	end)
+
+	connected = false
+	sessionId = nil
+	suppressedVscodeCreatePaths = {}
+	if quietLog ~= true then
+		local placeName = game.Name or "Unnamed"
+		logLine("Disconnected (" .. placeName .. ")")
+	end
+	if not silent then
+		UI.showNotification("Disconnected from VS Code.")
+	end
+end
+
+local function startPingLoop()
+	stopPingLoop()
+	pingAlive = true
+	task.spawn(function()
+		while pingAlive and connected and watcherAlive do
+			local ok = pcall(function()
+				HttpService:GetAsync(getBaseUrl() .. "/ping", true)
+			end)
+			if not ok then
+				if connected and pingAlive then
+					disconnect(true, withinHandoffGrace())
+				end
+				break
+			end
+			task.wait(Config.STUDIO_PING_INTERVAL)
+		end
+	end)
+end
+
+--- @param silent boolean if true, omit connection-failed toast (used while polling until server is up)
+local function connect(silent)
 	if connected then
 		return
 	end
@@ -2082,9 +2465,13 @@ local function connect()
 		end
 	end
 
+	local connectUrl = getBaseUrl() .. "/connect"
+	local connectStartedAt = os.clock()
+	local allowConnectBanner = lastStudioConnectBannerAt == 0
+		or (connectStartedAt - lastStudioConnectBannerAt) >= STUDIO_CONNECT_BANNER_COOLDOWN_SEC
 	local success, response = pcall(function()
 		return HttpService:PostAsync(
-			getBaseUrl() .. "/connect",
+			connectUrl,
 			HttpService:JSONEncode({
 				version = "0.1.0",
 				placeId = placeId,
@@ -2097,8 +2484,10 @@ local function connect()
 	end)
 
 	if not success then
-		warn("[RobloxSync] Could not connect to VS Code server: " .. tostring(response))
-		UI.showNotification("Connection failed. Make sure the VS Code server is running.", true)
+		if not silent then
+			warn(LOG_PREFIX .. " error: could not connect: " .. tostring(response))
+			UI.showNotification("Connection failed. In VS Code run Roblox Sync: Connect to Studio.", true)
+		end
 		return
 	end
 
@@ -2109,51 +2498,62 @@ local function connect()
 	changeDetector = ChangeDetector.new()
 
 	if doFullSync() then
+		lastFullySyncedAt = os.clock()
 		changeDetector:startTracking()
 		startPolling()
-		UI.showNotification("Connected to VS Code!")
+		startPingLoop()
+		if allowConnectBanner then
+			logLine("Connected (" .. placeName .. ")")
+			UI.showNotification("Connected to Roblox Sync (VS Code).")
+			lastStudioConnectBannerAt = os.clock()
+		end
 	else
 		connected = false
 		sessionId = nil
+		changeDetector = nil
 		UI.showNotification("Full sync failed.", true)
 	end
 end
 
-local function disconnect()
-	if not connected then
-		return
-	end
-
-	stopPolling()
-
-	if changeDetector then
-		changeDetector:stopTracking()
-		changeDetector = nil
-	end
-
-	pcall(function()
-		HttpService:PostAsync(
-			getBaseUrl() .. "/disconnect",
-			HttpService:JSONEncode({ sessionId = sessionId }),
-			Enum.HttpContentType.ApplicationJson
-		)
-	end)
-
-	connected = false
-	sessionId = nil
-	UI.showNotification("Disconnected from VS Code.")
-end
-
-connectButton.Click:Connect(function()
-	connect()
-end)
-
-disconnectButton.Click:Connect(function()
-	disconnect()
-end)
-
 plugin.Unloading:Connect(function()
-	disconnect()
+	watcherAlive = false
+	disconnect(true)
+end)
+
+-- Poll for VS Code server; auto-connect when it appears; disconnect locally when server stops.
+task.spawn(function()
+	while watcherAlive do
+		local ok, response = pcall(function()
+			return HttpService:GetAsync(getBaseUrl() .. "/status", true)
+		end)
+
+		if ok and type(response) == "string" and response ~= "" then
+			local decOk, data = pcall(function()
+				return HttpService:JSONDecode(response)
+			end)
+			if decOk and type(data) == "table" then
+				if type(data.studioPingIntervalSec) == "number" and data.studioPingIntervalSec > 0 then
+					Config.STUDIO_PING_INTERVAL = math.clamp(data.studioPingIntervalSec, 3, 30)
+				end
+				-- After a Cursor/VS Code window reload, the HTTP server comes back with connected=false
+				-- while we still have connected=true; reconnect in the same poll cycle.
+				-- Only skip the Disconnected log during handoff grace (same as ping / status loss).
+				if data.connected == false and connected then
+					disconnect(true, withinHandoffGrace())
+				end
+				if not connected then
+					connect(true)
+				end
+			end
+		else
+			if connected then
+				local g = withinHandoffGrace()
+				disconnect(true, g)
+			end
+		end
+
+		task.wait(Config.POLL_INTERVAL)
+	end
 end)
 
 end

@@ -1,0 +1,188 @@
+---
+description: Roblox / Luau development with Roblox Sync — worktree-first workflow and property reference
+globs: "**/*.lua,**/init.meta.json"
+alwaysApply: true
+---
+
+# Roblox development with Roblox Sync
+
+You are a **senior Roblox engineer** working in a **Roblox Sync** workspace. Optimize for production Luau: clear server authority, safe replication, performance, and maintainability. Prefer official patterns (`GetService`, `task.*`, attributes, well-named remotes) over fragile hacks.
+
+---
+
+## What Roblox Sync is
+
+**Roblox Sync** mirrors **Roblox Studio’s instance tree** as folders and files on disk (the **worktree**). When Studio is connected:
+
+- Edits in **VS Code / Cursor** (this workspace) sync **to Studio** in real time.
+- Changes in **Studio** sync **to the worktree**.
+
+The worktree is not a random repo layout—it **is** the game hierarchy under fixed **service roots** (e.g. `Workspace`, `ServerScriptService`, `ReplicatedStorage`). Treat folders as instances and `init.meta.json` as serialized properties.
+
+---
+
+## Creating instances from disk
+
+- **Folder name** = the instance’s **`Name`** in Studio (any clear name you want: `CoinPickup`, `MainMenu`, `Checkpoint`, …).
+- **`init.meta.json` is required** with a non-empty, valid **`className`**. Until that exists, nothing is created in Studio. Empty `{}` or missing `className` does not sync.
+- **Scripts:** add the matching init file and set `className` accordingly: `init.server.lua` → `Script`, `init.client.lua` → `LocalScript`, `init.lua` → `ModuleScript`.
+
+---
+
+## Nothing is auto-generated (properties & scripts)
+
+Roblox Sync **does not** scaffold or complete your files for you.
+
+| What | Reality |
+|------|---------|
+| **`init.meta.json` / `properties`** | **Not** auto-filled. Sync will **not** add missing keys, **not** inject Studio defaults into your JSON, and **not** “fix up” partial objects. You must author `properties` yourself. |
+| **`init.server.lua` / `init.client.lua` / `init.lua`** | **Not** auto-created. Script instances **only** sync source from disk when **you** create the matching file. No empty starter script is written for you. |
+
+**Complete `properties` is required for correct behavior**
+
+- Treat `properties` in `init.meta.json` as the **full set of writable instance state** you are defining for that object in the worktree.
+- **Every** property that instance must have for correct appearance, physics, UI layout, replication, or gameplay **must** be listed explicitly with a value. Do **not** omit properties and assume Roblox Studio or Sync will apply engine defaults on your behalf—**omitted properties are not reliably applied** the way they are when you insert an instance by hand in Studio.
+- If you are unsure of a value, **look up** the intended default in the reference and **write it** in JSON.
+
+---
+
+## Prefer the worktree over `Instance.new` when you can
+
+**Best practice:** Define **stable, editable objects** in the synced tree (folders + `init.meta.json` + optional script files) instead of building them only inside runtime scripts.
+
+**Why**
+
+- **Visibility** — Hierarchy matches what designers see in Studio; fewer “where did this come from?” bugs.
+- **Review & history** — Diffs and PRs show new Parts, UI, remotes, and property changes clearly.
+- **Iteration** — Tweaking positions, colors, and parent layout does not require redeploying script logic.
+- **Single source of truth** — Less duplication between “level in Studio” and “clone from a template in code.”
+
+**Good worktree candidates**
+
+- Level geometry, props, spawn locations, `Model` hierarchies.
+- UI trees under `StarterGui` / `PlayerGui` patterns (as synced).
+- Long-lived `RemoteEvent` / `RemoteFunction`, `Folder` organization, config `StringValue` / attributes on instances.
+- Scripts that **attach to** instances that already exist in the tree.
+
+**When scripts are the right place**
+
+- **Procedural or one-off runtime spawn** (e.g. projectiles, loot drops, dynamically sized grids).
+- **Pure logic** with no meaningful instance template (algorithms, services).
+- **Temporary** instances that should not be part of the saved place.
+
+**Example — avoid when worktree would do**
+
+```lua
+-- Avoid for a fixed shop sign that never changes at runtime:
+local part = Instance.new("Part")
+part.Name = "ShopSign"
+part.Parent = workspace
+```
+
+**Better:** `Workspace/.../ShopSign/` with `init.meta.json` (`className: "Part"` plus a **complete** `properties` object for every field that Part should have—Sync will not fill the rest for you).
+
+---
+
+## How to create and edit instances (worktree)
+
+1. **Pick the parent** — Under the correct service folder (e.g. `Workspace/MyLevel/`).
+2. **Create a child folder** — Name = instance `Name` in Studio (e.g. `TreasureChest`).
+3. **Add `TreasureChest/init.meta.json`** — Set **`className`**. Add a **`properties`** object with **all** required fields for that class (see above: nothing auto-fills; no defaults from Sync).
+4. **Add scripts only if you need them** — Create `init.server.lua` / `init.client.lua` / `init.lua` yourself; they are **never** created automatically. `className` in meta must match the script type.
+5. **Save** — Sync pushes changes to Studio when connected.
+
+**Rename** — Rename the folder (coalesced as a rename in Studio). **Delete** — Delete the folder. Do not delete protected **service root** folders.
+
+---
+
+## File layout (quick reference)
+
+| Piece | Path / rule |
+|-------|-------------|
+| Instance | `InstanceName/` |
+| Properties + class | `InstanceName/init.meta.json` |
+| Server script | `InstanceName/init.server.lua` → `Script` |
+| Client script | `InstanceName/init.client.lua` → `LocalScript` |
+| Module | `InstanceName/init.lua` → `ModuleScript` |
+
+Synced **top-level** folders (services): `Workspace`, `Players`, `Lighting`, `MaterialService`, `ReplicatedFirst`, `ReplicatedStorage`, `ServerScriptService`, `ServerStorage`, `StarterGui`, `StarterPack`, `StarterPlayer`, `SoundService`, `Teams`, `TextChatService`.
+
+## Engineering habits (short)
+
+- **Server authority** — Economy, data writes, anti-cheat, and validation live in **server** code (`Script` / server `ModuleScript` usage). **LocalScript** for client UI and local feedback only.
+- **Remotes** — `RemoteEvent` / `RemoteFunction`: validate arguments on the server; name clearly; consider rate limits on abuse-prone endpoints.
+- **API** — `game:GetService("Name")` where appropriate; prefer `task.wait` / `task.spawn` / `task.defer` over legacy globals.
+- **Types** — Use Luau types; `--!strict` when the file benefits; avoid unnecessary `any`.
+- **Errors** — Prefer explicit failures in development over silent `pcall` that hide bugs.
+
+### `init.meta.json` fields (reminder)
+
+- **`className`:** Required for every new instance from disk; must be a real Roblox class.
+- **`name`:** Omit; the **folder name** is the instance name.
+- **`properties`:** Keys = exact Roblox property names; values = JSON forms below. Include **every** property the instance must have—see **Nothing is auto-generated** above.
+
+---
+
+## Property types — JSON reference (use these shapes)
+
+Property names must match the Roblox API for that class. Encode values explicitly; Sync does not infer or back-fill missing entries.
+
+### Primitives
+
+| API type | JSON | Example |
+|----------|------|---------|
+| string | string | `"Hello"` |
+| int / int64 | number | `42` |
+| float / double | number | `3.14` |
+| bool | boolean | `true` |
+
+### Vectors
+
+| API type | JSON | Example |
+|----------|------|---------|
+| Vector2 | `[x, y]` | `[100, 50]` |
+| Vector3 | `[x, y, z]` | `[0, 5, 0]` |
+| Vector2int16 | `[x, y]` ints | `[64, 64]` |
+| Vector3int16 | `[x, y, z]` ints | `[0, 0, 0]` |
+
+### Color / brick
+
+| API type | JSON | Example |
+|----------|------|---------|
+| Color3 | `[r, g, b]` 0–1 | `[1, 0.5, 0]` |
+| BrickColor | string (name) | `"Bright blue"` |
+
+### UI
+
+| API type | JSON | Example |
+|----------|------|---------|
+| UDim | `[Scale, Offset]` | `[0.5, 0]` |
+| UDim2 | `[[XS, XO], [YS, YO]]` | `[[0, 100], [0, 50]]` |
+
+### CFrame
+
+`{"pos": [x,y,z], "rot": [m11..m33]}` — `rot` is **row-major** 3×3 rotation (9 numbers), same as Sync serializes from Studio.
+
+Identity:
+
+```json
+{"pos": [0, 0, 0], "rot": [1, 0, 0, 0, 1, 0, 0, 0, 1]}
+```
+
+### Other
+
+| API type | JSON | Example |
+|----------|------|---------|
+| Rect | `[minX, minY, maxX, maxY]` | `[0, 0, 200, 100]` |
+| NumberRange | `[min, max]` | `[0, 1]` |
+| NumberSequence | `[[time, value, envelope], ...]` | `[[0, 1, 0], [1, 0, 0]]` |
+| ColorSequence | `[[time, r, g, b], ...]` (0–1) | `[[0, 1, 0, 0], [1, 0, 0, 1]]` |
+| Font | `{"family", "weight", "style"}` | `{"family": "GothamBold", "weight": "Bold", "style": "Normal"}` |
+| Faces | `["Top", "Front", ...]` | allowed: Top, Bottom, Left, Right, Front, Back |
+| Axes | `["X", "Y"]` | allowed: X, Y, Z |
+| PhysicalProperties | `{"density","friction","elasticity","frictionWeight","elasticityWeight"}` | all numbers |
+| Ray | `{"origin":[x,y,z],"direction":[x,y,z]}` | |
+| Enum | `"Enum.Type.Item"` or shorthand when clear | `"Enum.Material.Neon"` |
+| Instance ref | `{"_ref": "Service.Path.To.Target"}` | `{"_ref": "Workspace.Map.Spawn"}` |
+
+**Do not set** unsupported / internal types: `Content`, `ProtectedString`, `BinaryString`, `UniqueId`, signals, connections, arbitrary `Array`/`Dictionary` blobs where Sync cannot round-trip.
