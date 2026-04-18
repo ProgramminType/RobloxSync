@@ -3,7 +3,8 @@ local PropertyHandler = require(script.Parent.PropertyHandler)
 local PropertyDatabase = require(script.Parent.PropertyDatabase)
 
 local Serializer = {}
-Serializer.skipDuplicates = false
+--- When false, duplicate sibling names only get unique names in the serialized tree (full sync); instances in Studio are not renamed.
+Serializer.renameLiveInstancesForDuplicateNames = true
 
 local _propCache = {}
 
@@ -83,41 +84,26 @@ function Serializer.serializeInstance(instance)
 		end
 	end
 
-	if Serializer.skipDuplicates then
-		local nameCounts = {}
-		for _, child in ipairs(instance:GetChildren()) do
-			if not Config.NON_SERIALIZABLE_CLASSES[child.ClassName] then
-				nameCounts[child.Name] = (nameCounts[child.Name] or 0) + 1
-			end
-		end
-
-		for _, child in ipairs(instance:GetChildren()) do
-			if nameCounts[child.Name] and nameCounts[child.Name] > 1 then
-				warn("[Roblox Sync] error: skipping duplicate " .. child:GetFullName())
+	local usedNames = {}
+	local renameLive = Serializer.renameLiveInstancesForDuplicateNames == true
+	for _, child in ipairs(instance:GetChildren()) do
+		local childData = Serializer.serializeInstance(child)
+		if childData then
+			local baseName = childData.name
+			if usedNames[baseName] then
+				local n = usedNames[baseName] + 1
+				usedNames[baseName] = n
+				local newName = baseName .. "_" .. tostring(n)
+				childData.name = newName
+				if renameLive then
+					pcall(function()
+						child.Name = newName
+					end)
+				end
 			else
-				local childData = Serializer.serializeInstance(child)
-				if childData then
-					table.insert(data.children, childData)
-				end
+				usedNames[baseName] = 1
 			end
-		end
-	else
-		local usedNames = {}
-		for _, child in ipairs(instance:GetChildren()) do
-			local childData = Serializer.serializeInstance(child)
-			if childData then
-				local baseName = childData.name
-				if usedNames[baseName] then
-					local n = usedNames[baseName] + 1
-					usedNames[baseName] = n
-					local newName = baseName .. "_" .. tostring(n)
-					childData.name = newName
-					pcall(function() child.Name = newName end)
-				else
-					usedNames[baseName] = 1
-				end
-				table.insert(data.children, childData)
-			end
+			table.insert(data.children, childData)
 		end
 	end
 

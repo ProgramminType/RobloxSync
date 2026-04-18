@@ -277,7 +277,7 @@ async function startServer(context: vscode.ExtensionContext, projectPath: string
 
   const onPluginConnected = (
     placeId: number,
-    _placeName: string,
+    placeName: string,
     experienceName: string,
     structureHash: string
   ) => {
@@ -286,23 +286,33 @@ async function startServer(context: vscode.ExtensionContext, projectPath: string
     fs.mkdirSync(workspaceDir, { recursive: true });
     fs.writeFileSync(
       path.join(workspaceDir, MARKER_FILE),
-      JSON.stringify({ created: Date.now(), version: "0.1.0" })
+      JSON.stringify({ created: Date.now(), version: "1.4.0" })
     );
     copyCursorrulesToWorkspace(context.extensionPath, workspaceDir);
     const workspacePath = ensureWorkspaceFile(workspaceDir);
 
     server?.setProjectPath(workspaceDir, context.extensionPath);
 
-    const workspaceUri = vscode.Uri.file(workspacePath);
-    void (async () => {
-      try {
-        await context.globalState.update(RESUME_SERVER_PROJECT_KEY, workspaceDir);
-        await vscode.commands.executeCommand("vscode.openFolder", workspaceUri, false);
-      } catch (err) {
-        console.error("[RobloxSync] openFolder after Studio connect failed:", err);
-        void context.globalState.update(RESUME_SERVER_PROJECT_KEY, undefined);
-      }
-    })();
+    const connectDetail = experienceName || placeName || String(placeId || "unpublished");
+
+    const alreadyOnThisProject =
+      vscode.workspace.workspaceFolders?.some((f) => pathsEqualFs(f.uri.fsPath, workspaceDir)) === true;
+    if (alreadyOnThisProject) {
+      void context.globalState.update(RESUME_SERVER_PROJECT_KEY, workspaceDir);
+    } else {
+      const workspaceUri = vscode.Uri.file(workspacePath);
+      void (async () => {
+        try {
+          await context.globalState.update(RESUME_SERVER_PROJECT_KEY, workspaceDir);
+          await vscode.commands.executeCommand("vscode.openFolder", workspaceUri, false);
+        } catch (err) {
+          console.error("[RobloxSync] openFolder after Studio connect failed:", err);
+          void context.globalState.update(RESUME_SERVER_PROJECT_KEY, undefined);
+        }
+      })();
+    }
+
+    syncLog.connected(connectDetail);
   };
 
   server = new SyncServer(port, fileManager, changeQueue, fileWatcher, onPluginConnected, () => {

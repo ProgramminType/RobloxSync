@@ -18,13 +18,13 @@
 **Easiest:** Install the pre-built `.vsix` from the [Releases](https://github.com/ProgramminType/RobloxSync/releases) page:
 
 ```bash
-code --install-extension roblox-sync-0.1.0.vsix
+code --install-extension roblox-sync-1.4.0.vsix
 ```
 
 Or in Cursor:
 
 ```bash
-cursor --install-extension roblox-sync-0.1.0.vsix
+cursor --install-extension roblox-sync-1.4.0.vsix
 ```
 
 Alternatively, open the Extensions view (Ctrl+Shift+X), click the **⋯** menu, choose **Install from VSIX**, and select the `.vsix` file.
@@ -97,10 +97,10 @@ npm run build
 npx @vscode/vsce package --allow-missing-repository
 ```
 
-This writes `roblox-sync-0.1.0.vsix` in `vscode-extension/`. Install it from that folder, for example:
+This writes `roblox-sync-1.4.0.vsix` in `vscode-extension/`. Install it from that folder, for example:
 
 ```bash
-cursor --install-extension roblox-sync-0.1.0.vsix --force
+cursor --install-extension roblox-sync-1.4.0.vsix --force
 ```
 
 ## License

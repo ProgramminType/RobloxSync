@@ -97,7 +97,7 @@ function buildPlugin() {
   const entrySource = readModule("init.server.lua");
 
   let output = `--[=[
-  Roblox Sync Plugin v0.1.0
+  Roblox Sync Plugin v1.4.0
   Auto-generated — do not edit directly.
   Edit the source files in roblox-plugin/src/ instead.
 ]=]

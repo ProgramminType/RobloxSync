@@ -21,6 +21,35 @@ The worktree is not a random repo layout—it **is** the game hierarchy under fi
 
 ---
 
+## Respect existing user changes
+
+- **Read before editing** — Open the relevant `init.meta.json` and scripts; assume the user’s current files are intentional unless they asked for a full rewrite.
+- **Minimal diffs** — Change only what is needed for the request. Do **not** reformat, reorder, or “clean up” unrelated properties, comments, or sibling folders.
+- **Preserve structure** — Keep existing `properties` keys and values unless the task requires updating them; do not strip fields because they look redundant.
+- **No silent bulk regeneration** — Do not replace entire trees, large JSON blobs, or whole scripts to “fix” things without explicit user consent.
+- **Generators overwrite** — **Python (or any script) that writes `init.meta.json` or `.lua` files will overwrite whatever is on disk.** That can wipe hand-tuned values, comments (if any), or partial edits. Always treat existing file content as authoritative until you have merged or the user has approved a full replace.
+
+---
+
+## Python and other helpers (recommended — use with care)
+
+**Using small Python programs to speed up bulk work** (scaffolding folders, filling `properties` from a table, renaming paths, validating JSON) **is recommended** when it saves time—**as long as you protect the user’s edits.**
+
+**Critical:** A typical script does **`open(path, "w")` → entire file replaced**. Anything the user (or Studio) had in that file and that your script does not re-emit is **lost**. Sync will then push that loss to Studio.
+
+**Do this instead**
+
+- **Read → merge → write** — Load existing `init.meta.json`, update only the keys the task needs, preserve unknown keys unless the user asked to normalize.
+- **Scope narrowly** — Touch only paths the user asked about; never sweep the whole tree unless they explicitly want a full regeneration.
+- **Prefer a staging review** — Write to stdout or a temp path first, or show a diff, when the operation is large or destructive.
+- **Place helpers sensibly** — Keep `*.py` / tooling **outside** the synced instance tree when possible (e.g. repo root next to the worktree, or a `tools/` folder the user added on purpose), so Python files are not mistaken for game assets.
+
+**Still avoid** pointless clutter inside **service folders** (random `README.md`, `package.json`, `.env`) unless the user wants them there.
+
+**Round-tripped game files** remain: instance folders under service roots, **`init.meta.json`**, **`init.server.lua`**, **`init.client.lua`**, **`init.lua`**.
+
+---
+
 ## Creating instances from disk
 
 - **Folder name** = the instance’s **`Name`** in Studio (any clear name you want: `CoinPickup`, `MainMenu`, `Checkpoint`, …).
@@ -46,7 +75,33 @@ Roblox Sync **does not** scaffold or complete your files for you.
 
 ---
 
-## Prefer the worktree over `Instance.new` when you can
+## How to create and edit instances (worktree)
+
+1. **Pick the parent** — Under the correct service folder (e.g. `Workspace/MyLevel/`).
+2. **Create a child folder** — Name = instance `Name` in Studio (e.g. `TreasureChest`).
+3. **Add `TreasureChest/init.meta.json`** — Set **`className`**. Add a **`properties`** object with **all** required fields for that class (see above: nothing auto-fills; no defaults from Sync).
+4. **Add scripts only if you need them** — Create `init.server.lua` / `init.client.lua` / `init.lua` yourself; they are **never** created automatically. `className` in meta must match the script type.
+5. **Save** — Sync pushes changes to Studio when connected.
+
+**Rename** — Rename the folder (coalesced as a rename in Studio). **Delete** — Delete the folder. Do not delete protected **service root** folders.
+
+---
+
+## File layout (quick reference)
+
+| Piece | Path / rule |
+|-------|-------------|
+| Instance | `InstanceName/` |
+| Properties + class | `InstanceName/init.meta.json` |
+| Server script | `InstanceName/init.server.lua` → `Script` |
+| Client script | `InstanceName/init.client.lua` → `LocalScript` |
+| Module | `InstanceName/init.lua` → `ModuleScript` |
+
+Synced **top-level** folders (services): `Workspace`, `Players`, `Lighting`, `MaterialService`, `ReplicatedFirst`, `ReplicatedStorage`, `ServerScriptService`, `ServerStorage`, `StarterGui`, `StarterPack`, `StarterPlayer`, `SoundService`, `Teams`, `TextChatService`.
+
+---
+
+## Prefer the worktree over `Instance.new` when you can, ESPECIALLY FOR ANY UI ELEMENTS
 
 **Best practice:** Define **stable, editable objects** in the synced tree (folders + `init.meta.json` + optional script files) instead of building them only inside runtime scripts.
 
@@ -82,30 +137,6 @@ part.Parent = workspace
 **Better:** `Workspace/.../ShopSign/` with `init.meta.json` (`className: "Part"` plus a **complete** `properties` object for every field that Part should have—Sync will not fill the rest for you).
 
 ---
-
-## How to create and edit instances (worktree)
-
-1. **Pick the parent** — Under the correct service folder (e.g. `Workspace/MyLevel/`).
-2. **Create a child folder** — Name = instance `Name` in Studio (e.g. `TreasureChest`).
-3. **Add `TreasureChest/init.meta.json`** — Set **`className`**. Add a **`properties`** object with **all** required fields for that class (see above: nothing auto-fills; no defaults from Sync).
-4. **Add scripts only if you need them** — Create `init.server.lua` / `init.client.lua` / `init.lua` yourself; they are **never** created automatically. `className` in meta must match the script type.
-5. **Save** — Sync pushes changes to Studio when connected.
-
-**Rename** — Rename the folder (coalesced as a rename in Studio). **Delete** — Delete the folder. Do not delete protected **service root** folders.
-
----
-
-## File layout (quick reference)
-
-| Piece | Path / rule |
-|-------|-------------|
-| Instance | `InstanceName/` |
-| Properties + class | `InstanceName/init.meta.json` |
-| Server script | `InstanceName/init.server.lua` → `Script` |
-| Client script | `InstanceName/init.client.lua` → `LocalScript` |
-| Module | `InstanceName/init.lua` → `ModuleScript` |
-
-Synced **top-level** folders (services): `Workspace`, `Players`, `Lighting`, `MaterialService`, `ReplicatedFirst`, `ReplicatedStorage`, `ServerScriptService`, `ServerStorage`, `StarterGui`, `StarterPack`, `StarterPlayer`, `SoundService`, `Teams`, `TextChatService`.
 
 ## Engineering habits (short)
 

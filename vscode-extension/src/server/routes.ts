@@ -78,7 +78,7 @@ export class RouteHandler {
     res.end(
       JSON.stringify({
         connected: this.session.connected,
-        version: "0.1.0",
+        version: "1.4.0",
         sessionId: this.session.sessionId,
         studioInactivityTimeoutSec: cfg.get<number>("studioInactivityTimeoutSec", 45),
         studioPingIntervalSec: cfg.get<number>("studioPingIntervalSec", 8),
@@ -151,7 +151,6 @@ export class RouteHandler {
     const experienceName = data.experienceName ?? placeName;
     const structureHash = data.structureHash ?? "";
 
-    syncLog.connected(experienceName || placeName || String(placeId || "unpublished"));
     this.touchStudioLiveness();
     this.startStudioInactivityWatcher();
     this.onPluginConnected?.(placeId, placeName, experienceName, structureHash);
@@ -165,7 +164,18 @@ export class RouteHandler {
     );
   }
 
-  private async handleDisconnect(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  private async handleDisconnect(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let soft = false;
+    try {
+      const body = await readBody(req);
+      if (body) {
+        const data = JSON.parse(body) as { sessionId?: string; soft?: boolean };
+        soft = data.soft === true;
+      }
+    } catch {
+      // Legacy clients: empty or non-JSON body
+    }
+
     this.stopStudioInactivityWatcher();
     this.session = {
       connected: false,
@@ -176,9 +186,13 @@ export class RouteHandler {
     res.writeHead(200);
     res.end(JSON.stringify({ status: "disconnected" }));
 
-    const onDisconnect = this.onPluginDisconnected;
-    if (onDisconnect) {
-      setImmediate(() => onDisconnect());
+    if (soft) {
+      syncLog.line("Studio paused sync (e.g. Play Mode). Server still running; connect again when you return to Edit.");
+    } else {
+      const onDisconnect = this.onPluginDisconnected;
+      if (onDisconnect) {
+        setImmediate(() => onDisconnect());
+      }
     }
   }
 

@@ -1,16 +1,14 @@
 local UI = {}
 
-local StarterGui = game:GetService("StarterGui")
+local LOG_PREFIX = "[Roblox Sync]"
 
 function UI.showNotification(text, isWarning)
-	-- Output logging is handled in init.server.lua (consistent [Roblox Sync] lines).
-	pcall(function()
-		StarterGui:SetCore("SendNotification", {
-			Title = "Roblox Studio Sync",
-			Text = text,
-			Duration = 4,
-		})
-	end)
+	-- Plugins cannot use StarterGui:SetCore (must be a LocalScript). Use Studio output only.
+	if isWarning then
+		warn(LOG_PREFIX .. " " .. text)
+	else
+		print(LOG_PREFIX .. " " .. text)
+	end
 end
 
 return UI

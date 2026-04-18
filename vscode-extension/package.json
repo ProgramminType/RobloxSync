@@ -2,7 +2,7 @@
   "name": "roblox-sync",
   "displayName": "Roblox Sync",
   "description": "Bidirectional real-time sync between Roblox Studio and VS Code. Edit your entire game—scripts, instances, and properties—from your editor and see changes instantly in Studio.",
-  "version": "0.1.0",
+  "version": "1.4.0",
   "publisher": "roblox-sync",
   "icon": "media/logo.png",
   "license": "SEE LICENSE IN LICENSE.txt",

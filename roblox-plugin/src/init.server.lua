@@ -26,6 +26,8 @@ local lastStudioConnectBannerAt = 0
 local STUDIO_CONNECT_BANNER_COOLDOWN_SEC = 90
 -- Paths for which we echoed an Update after a VS Code create; filter duplicate ChangeDetector creates (incl. deferred scripts).
 local suppressedVscodeCreatePaths = {}
+-- Label for Studio output: matches API experience name when available (game.Name is often "Place 1").
+local lastConnectDisplayName = nil
 
 local function withinHandoffGrace(): boolean
 	return (os.clock() - lastFullySyncedAt) < HANDOFF_GRACE_SEC
@@ -130,7 +132,7 @@ local function dedupeUpdatesShadowedByCreatesInBatch(studioChanges)
 end
 
 local function doFullSync()
-	Serializer.skipDuplicates = true
+	Serializer.renameLiveInstancesForDuplicateNames = false
 
 	local tree = {}
 	for _, serviceName in ipairs(Config.SYNCED_SERVICES) do
@@ -140,7 +142,7 @@ local function doFullSync()
 		end
 	end
 
-	Serializer.skipDuplicates = false
+	Serializer.renameLiveInstancesForDuplicateNames = true
 
 	local body = HttpService:JSONEncode({ tree = tree })
 	local success, err = pcall(function()
@@ -307,12 +309,36 @@ local function disconnect(silent, quietLog)
 	sessionId = nil
 	suppressedVscodeCreatePaths = {}
 	if quietLog ~= true then
-		local placeName = game.Name or "Unnamed"
-		logLine("Disconnected (" .. placeName .. ")")
+		local label = lastConnectDisplayName or (game.Name or "Unnamed")
+		lastConnectDisplayName = nil
+		logLine("Disconnected (" .. label .. ")")
 	end
 	if not silent then
 		UI.showNotification("Disconnected from VS Code.")
 	end
+end
+
+--- End Play Mode without tearing down the VS Code HTTP server (soft disconnect).
+local function disconnectPlayMode()
+	stopPingLoop()
+	stopPolling()
+	if changeDetector then
+		changeDetector:stopTracking()
+		changeDetector = nil
+	end
+	if connected and sessionId then
+		pcall(function()
+			HttpService:PostAsync(
+				getBaseUrl() .. "/disconnect",
+				HttpService:JSONEncode({ sessionId = sessionId, soft = true }),
+				Enum.HttpContentType.ApplicationJson
+			)
+		end)
+	end
+	connected = false
+	sessionId = nil
+	suppressedVscodeCreatePaths = {}
+	logLine("Sync paused (Play Mode). VS Code keeps running; will resume when you stop play.")
 end
 
 local function startPingLoop()
@@ -337,6 +363,9 @@ end
 --- @param silent boolean if true, omit connection-failed toast (used while polling until server is up)
 local function connect(silent)
 	if connected then
+		return
+	end
+	if RunService:IsRunning() then
 		return
 	end
 
@@ -386,7 +415,7 @@ local function connect(silent)
 		return HttpService:PostAsync(
 			connectUrl,
 			HttpService:JSONEncode({
-				version = "0.1.0",
+				version = "1.4.0",
 				placeId = placeId,
 				placeName = placeName,
 				experienceName = experienceName,
@@ -416,8 +445,8 @@ local function connect(silent)
 		startPolling()
 		startPingLoop()
 		if allowConnectBanner then
-			logLine("Connected (" .. placeName .. ")")
-			UI.showNotification("Connected to Roblox Sync (VS Code).")
+			lastConnectDisplayName = experienceName
+			logLine("Connected (" .. experienceName .. ")")
 			lastStudioConnectBannerAt = os.clock()
 		end
 	else
@@ -436,6 +465,14 @@ end)
 -- Poll for VS Code server; auto-connect when it appears; disconnect locally when server stops.
 task.spawn(function()
 	while watcherAlive do
+		if RunService:IsRunning() then
+			if connected then
+				disconnectPlayMode()
+			end
+			task.wait(Config.POLL_INTERVAL)
+			continue
+		end
+
 		local ok, response = pcall(function()
 			return HttpService:GetAsync(getBaseUrl() .. "/status", true)
 		end)
