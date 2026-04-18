@@ -7,6 +7,7 @@ import { SessionState, InstanceData, Change } from "../types";
 import { randomUUID } from "crypto";
 import * as syncLog from "../syncLog";
 import { UI } from "../ui/messages";
+import { resolveExperienceTitleFromPlaceId, resolveExperienceTitleFromUniverseId } from "./experienceTitle";
 
 /** Avoid spamming the banner on back-to-back full syncs (e.g. reconnect after editor reload). */
 let lastWorkspaceReadyBannerAt = 0;
@@ -21,6 +22,8 @@ export class RouteHandler {
 
   private lastStudioLivenessAt = 0;
   private inactivityTimer: ReturnType<typeof setInterval> | null = null;
+  /** True while a multi-request full sync is in progress (watcher stays paused until `end`). */
+  private fullSyncBulkPause = false;
 
   constructor(
     private fileManager: FileManager,
@@ -78,7 +81,7 @@ export class RouteHandler {
     res.end(
       JSON.stringify({
         connected: this.session.connected,
-        version: "1.4.0",
+        version: "1.5.0",
         sessionId: this.session.sessionId,
         studioInactivityTimeoutSec: cfg.get<number>("studioInactivityTimeoutSec", 45),
         studioPingIntervalSec: cfg.get<number>("studioPingIntervalSec", 8),
@@ -138,6 +141,8 @@ export class RouteHandler {
       placeName?: string;
       experienceName?: string;
       structureHash?: string;
+      /** DataModel.GameId (universe id); sent when placeId is 0 but the file is cloud-linked. */
+      gameId?: number;
     };
 
     this.session = {
@@ -148,18 +153,34 @@ export class RouteHandler {
 
     const placeId = data.placeId ?? 0;
     const placeName = data.placeName ?? "Unnamed";
-    const experienceName = data.experienceName ?? placeName;
+    const clientExperienceName = data.experienceName ?? placeName;
     const structureHash = data.structureHash ?? "";
+    const gameId = typeof data.gameId === "number" && data.gameId > 0 ? data.gameId : 0;
+
+    let displayName = clientExperienceName;
+    if (placeId > 0) {
+      const resolved = await resolveExperienceTitleFromPlaceId(placeId);
+      if (resolved) {
+        displayName = resolved;
+      }
+    }
+    if (displayName === clientExperienceName && gameId > 0) {
+      const resolved = await resolveExperienceTitleFromUniverseId(gameId);
+      if (resolved) {
+        displayName = resolved;
+      }
+    }
 
     this.touchStudioLiveness();
     this.startStudioInactivityWatcher();
-    this.onPluginConnected?.(placeId, placeName, experienceName, structureHash);
+    this.onPluginConnected?.(placeId, placeName, displayName, structureHash);
 
     res.writeHead(200);
     res.end(
       JSON.stringify({
         sessionId: this.session.sessionId,
         status: "connected",
+        displayName,
       })
     );
   }
@@ -198,30 +219,83 @@ export class RouteHandler {
 
   private async handleFullSync(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = await readBody(req);
-    const data = JSON.parse(body) as { tree: InstanceData[] };
+    const data = JSON.parse(body) as {
+      tree?: InstanceData[];
+      mode?: string;
+      roots?: InstanceData[];
+      parentPath?: string;
+      instances?: InstanceData[];
+    };
 
     if (this.session.connected) {
       this.touchStudioLiveness();
     }
 
-    // Pause file watcher while writing to avoid echo
-    this.fileWatcher.pause();
-    try {
-      await this.fileManager.writeFullTree(data.tree);
-      this.session.lastFullSync = Date.now();
-    } finally {
-      // Small delay before resuming to let FS events settle
-      setTimeout(() => this.fileWatcher.resume(), 500);
+    const mode = data.mode;
+
+    // Legacy: single POST with full tree (small places only; Roblox HttpService caps ~1 MB)
+    if (data.tree && !mode) {
+      this.fileWatcher.pause();
+      try {
+        await this.fileManager.writeFullTree(data.tree);
+        this.session.lastFullSync = Date.now();
+      } finally {
+        setTimeout(() => this.fileWatcher.resume(), 500);
+      }
+      this.maybeShowWorkspaceReadyBanner();
+      res.writeHead(200);
+      res.end(JSON.stringify({ status: "ok", timestamp: Date.now() }));
+      return;
     }
 
+    if (mode === "begin") {
+      this.fileWatcher.pause();
+      this.fullSyncBulkPause = true;
+      this.fileManager.beginFullSync();
+      res.writeHead(200);
+      res.end(JSON.stringify({ status: "ok", phase: "begin" }));
+      return;
+    }
+
+    if (mode === "roots") {
+      this.fileManager.appendFullSyncRoots(data.roots ?? []);
+      res.writeHead(200);
+      res.end(JSON.stringify({ status: "ok", phase: "roots" }));
+      return;
+    }
+
+    if (mode === "children") {
+      const parentPath = data.parentPath ?? "";
+      if (parentPath.length > 0) {
+        this.fileManager.appendFullSyncChildren(parentPath, data.instances ?? []);
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify({ status: "ok", phase: "children" }));
+      return;
+    }
+
+    if (mode === "end") {
+      this.session.lastFullSync = Date.now();
+      if (this.fullSyncBulkPause) {
+        this.fullSyncBulkPause = false;
+        setTimeout(() => this.fileWatcher.resume(), 500);
+      }
+      this.maybeShowWorkspaceReadyBanner();
+      res.writeHead(200);
+      res.end(JSON.stringify({ status: "ok", phase: "end" }));
+      return;
+    }
+
+    res.writeHead(400);
+    res.end(JSON.stringify({ error: "Invalid full-sync payload" }));
+  }
+
+  private maybeShowWorkspaceReadyBanner(): void {
     const now = Date.now();
     if (now - lastWorkspaceReadyBannerAt >= WORKSPACE_READY_BANNER_DEBOUNCE_MS) {
       lastWorkspaceReadyBannerAt = now;
       void vscode.window.showInformationMessage(UI.workspaceReadyToEdit);
     }
-
-    res.writeHead(200);
-    res.end(JSON.stringify({ status: "ok", timestamp: Date.now() }));
   }
 
   private async handleStudioChanges(req: IncomingMessage, res: ServerResponse): Promise<void> {

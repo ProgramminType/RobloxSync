@@ -1,5 +1,6 @@
 local Config = require(script.Parent.Config)
 local Serializer = require(script.Parent.Serializer)
+local DuplicateSiblingWatcher = require(script.Parent.DuplicateSiblingWatcher)
 
 -- New scripts from Studio get empty Source so sync matches VS Code (no default template race).
 local SCRIPT_CLASS_NAMES = {
@@ -54,35 +55,7 @@ function ChangeDetector:startTracking()
 				return
 			end
 
-			-- Dedup: rename if a sibling with the same name already exists
-			if descendant.Parent then
-				local baseName = descendant.Name
-				local hasDupe = false
-				for _, sibling in ipairs(descendant.Parent:GetChildren()) do
-					if sibling ~= descendant and sibling.Name == baseName then
-						hasDupe = true
-						break
-					end
-				end
-				if hasDupe then
-					local n = 2
-					while true do
-						local candidate = baseName .. "_" .. tostring(n)
-						local taken = false
-						for _, sibling in ipairs(descendant.Parent:GetChildren()) do
-							if sibling ~= descendant and sibling.Name == candidate then
-								taken = true
-								break
-							end
-						end
-						if not taken then
-							pcall(function() descendant.Name = candidate end)
-							break
-						end
-						n = n + 1
-					end
-				end
-			end
+			DuplicateSiblingWatcher.ensureUniqueAmongSiblings(descendant)
 
 			self:_trackInstance(descendant)
 
@@ -212,36 +185,7 @@ function ChangeDetector:_trackInstance(instance)
 
 		-- Handle renames before IGNORED_PROPERTIES check
 		if property == "Name" then
-			-- Dedup: check if new name collides with a sibling
-			if instance.Parent then
-				local newName = instance.Name
-				local hasDupe = false
-				for _, sibling in ipairs(instance.Parent:GetChildren()) do
-					if sibling ~= instance and sibling.Name == newName then
-						hasDupe = true
-						break
-					end
-				end
-				if hasDupe then
-					local baseName = newName
-					local n = 2
-					while true do
-						local candidate = baseName .. "_" .. tostring(n)
-						local taken = false
-						for _, sibling in ipairs(instance.Parent:GetChildren()) do
-							if sibling ~= instance and sibling.Name == candidate then
-								taken = true
-								break
-							end
-						end
-						if not taken then
-							pcall(function() instance.Name = candidate end)
-							return
-						end
-						n = n + 1
-					end
-				end
-			end
+			DuplicateSiblingWatcher.ensureUniqueAmongSiblings(instance)
 
 			local oldPath = self._pathCache[instance]
 			local finalName = instance.Name

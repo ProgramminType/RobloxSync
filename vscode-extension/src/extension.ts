@@ -189,6 +189,12 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       if (!vscode.workspace.workspaceFolders?.length) {
+        // openFolder(workspaceUri) often fires this with zero folders while the window reloads.
+        // Stopping the server here shows a bogus "Workspace disconnected" toast and drops Studio.
+        const pendingResume = context.globalState.get<string>(RESUME_SERVER_PROJECT_KEY);
+        if (pendingResume) {
+          return;
+        }
         void stopAndCleanup();
         return;
       }
@@ -286,14 +292,12 @@ async function startServer(context: vscode.ExtensionContext, projectPath: string
     fs.mkdirSync(workspaceDir, { recursive: true });
     fs.writeFileSync(
       path.join(workspaceDir, MARKER_FILE),
-      JSON.stringify({ created: Date.now(), version: "1.4.0" })
+      JSON.stringify({ created: Date.now(), version: "1.5.0" })
     );
     copyCursorrulesToWorkspace(context.extensionPath, workspaceDir);
     const workspacePath = ensureWorkspaceFile(workspaceDir);
 
     server?.setProjectPath(workspaceDir, context.extensionPath);
-
-    const connectDetail = experienceName || placeName || String(placeId || "unpublished");
 
     const alreadyOnThisProject =
       vscode.workspace.workspaceFolders?.some((f) => pathsEqualFs(f.uri.fsPath, workspaceDir)) === true;
@@ -312,7 +316,7 @@ async function startServer(context: vscode.ExtensionContext, projectPath: string
       })();
     }
 
-    syncLog.connected(connectDetail);
+    syncLog.connected();
   };
 
   server = new SyncServer(port, fileManager, changeQueue, fileWatcher, onPluginConnected, () => {
@@ -340,8 +344,10 @@ async function stopAndCleanup(options?: { suppressUserMessage?: boolean }): Prom
   server = null;
 
   statusBar?.setDisconnected();
-  syncLog.disconnected();
+  // suppressUserMessage is used for extension deactivation / process shutdown (e.g. openFolder reload).
+  // Do not log "Disconnected" there — it reads like Studio dropped the session even though we reconnect immediately.
   if (!options?.suppressUserMessage) {
+    syncLog.disconnected();
     vscode.window.showInformationMessage(UI.disconnected);
   }
 }

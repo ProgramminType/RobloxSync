@@ -1,5 +1,5 @@
 --[=[
-  Roblox Sync Plugin v1.4.0
+  Roblox Sync Plugin v1.5.0
   Auto-generated — do not edit directly.
   Edit the source files in roblox-plugin/src/ instead.
 ]=]
@@ -1261,6 +1261,51 @@ function Serializer.getInstanceDotPath(instance)
 	return table.concat(segments, ".")
 end
 
+--- Stem + numeric suffix for sibling dedup: `Part` / `Part1` / `Part2` (compact) or legacy `Part_2`.
+--- Unnumbered name counts as index 1.
+function Serializer.stemAndSuffixIndex(name)
+	local stemU, numStr = string.match(name, "^(.+)_([0-9]+)$")
+	if stemU and numStr then
+		return stemU, tonumber(numStr) or 1
+	end
+	local i = #name
+	while i >= 1 do
+		local c = string.byte(name, i)
+		if c < 48 or c > 57 then
+			break
+		end
+		i = i - 1
+	end
+	if i < #name and i >= 1 then
+		local stem = string.sub(name, 1, i)
+		local run = string.sub(name, i + 1)
+		if stem ~= "" and run ~= "" then
+			return stem, tonumber(run) or 1
+		end
+	end
+	return name, 1
+end
+
+--- Next sibling name not in `occupied` (e.g. Part + Part → Part2; Part2 + Part2 → Part3). Uses Part2 not Part_2.
+function Serializer.nextUniqueSiblingName(baseName, occupied)
+	local stem = Serializer.stemAndSuffixIndex(baseName)
+	local maxN = 0
+	for occName, _ in pairs(occupied) do
+		local s, idx = Serializer.stemAndSuffixIndex(occName)
+		if s == stem then
+			maxN = math.max(maxN, idx)
+		end
+	end
+	local n = maxN + 1
+	while true do
+		local candidate = stem .. tostring(n)
+		if not occupied[candidate] then
+			return candidate
+		end
+		n = n + 1
+	end
+end
+
 function Serializer.serializeInstance(instance)
 	if Config.NON_SERIALIZABLE_CLASSES[instance.ClassName] then
 		return nil
@@ -1296,25 +1341,23 @@ function Serializer.serializeInstance(instance)
 		end
 	end
 
-	local usedNames = {}
+	local occupied: { [string]: boolean } = {}
 	local renameLive = Serializer.renameLiveInstancesForDuplicateNames == true
 	for _, child in ipairs(instance:GetChildren()) do
 		local childData = Serializer.serializeInstance(child)
 		if childData then
 			local baseName = childData.name
-			if usedNames[baseName] then
-				local n = usedNames[baseName] + 1
-				usedNames[baseName] = n
-				local newName = baseName .. "_" .. tostring(n)
-				childData.name = newName
+			local finalName = baseName
+			if occupied[baseName] then
+				finalName = Serializer.nextUniqueSiblingName(baseName, occupied)
+				childData.name = finalName
 				if renameLive then
 					pcall(function()
-						child.Name = newName
+						child.Name = finalName
 					end)
 				end
-			else
-				usedNames[baseName] = 1
 			end
+			occupied[finalName] = true
 			table.insert(data.children, childData)
 		end
 	end
@@ -1764,9 +1807,128 @@ return Deserializer
 
 end
 
+_modules["DuplicateSiblingWatcher"] = function()
+local Config = _require("Config")
+local Serializer = _require("Serializer")
+
+local DuplicateSiblingWatcher = {}
+DuplicateSiblingWatcher.__index = DuplicateSiblingWatcher
+
+local function ensureUniqueAmongSiblings(instance)
+	if not instance or not instance.Parent then
+		return
+	end
+	local baseName = instance.Name
+	local hasDupe = false
+	for _, sibling in ipairs(instance.Parent:GetChildren()) do
+		if sibling ~= instance and sibling.Name == baseName then
+			hasDupe = true
+			break
+		end
+	end
+	if not hasDupe then
+		return
+	end
+	local occupied = {}
+	for _, sibling in ipairs(instance.Parent:GetChildren()) do
+		if sibling ~= instance then
+			occupied[sibling.Name] = true
+		end
+	end
+	local candidate = Serializer.nextUniqueSiblingName(instance.Name, occupied)
+	pcall(function()
+		instance.Name = candidate
+	end)
+end
+
+--- Used by ChangeDetector while syncing so the same rule applies whether or not VS Code is connected.
+DuplicateSiblingWatcher.ensureUniqueAmongSiblings = ensureUniqueAmongSiblings
+
+function DuplicateSiblingWatcher.new()
+	local self = setmetatable({}, DuplicateSiblingWatcher)
+	self._connections = {}
+	self._nameConnections = {}
+	self._tracking = false
+	return self
+end
+
+function DuplicateSiblingWatcher:_trackNameCollision(instance)
+	if Config.NON_SERIALIZABLE_CLASSES[instance.ClassName] then
+		return
+	end
+	if self._nameConnections[instance] ~= nil then
+		return
+	end
+	local conn = instance.Changed:Connect(function(property)
+		if not self._tracking or property ~= "Name" then
+			return
+		end
+		ensureUniqueAmongSiblings(instance)
+	end)
+	self._nameConnections[instance] = conn
+end
+
+function DuplicateSiblingWatcher:_untrackNameCollision(instance)
+	local conn = self._nameConnections[instance]
+	if conn then
+		conn:Disconnect()
+		self._nameConnections[instance] = nil
+	end
+end
+
+--- Runs for the lifetime of the plugin (not tied to VS Code connection).
+function DuplicateSiblingWatcher:start()
+	if self._tracking then
+		return
+	end
+	self._tracking = true
+
+	for _, serviceName in ipairs(Config.SYNCED_SERVICES) do
+		local service = game:FindService(serviceName)
+		if not service then
+			continue
+		end
+
+		for _, descendant in ipairs(service:GetDescendants()) do
+			self:_trackNameCollision(descendant)
+		end
+
+		local addedConn = service.DescendantAdded:Connect(function(descendant)
+			if not self._tracking then
+				return
+			end
+			ensureUniqueAmongSiblings(descendant)
+			self:_trackNameCollision(descendant)
+		end)
+		table.insert(self._connections, addedConn)
+
+		local removingConn = service.DescendantRemoving:Connect(function(descendant)
+			self:_untrackNameCollision(descendant)
+		end)
+		table.insert(self._connections, removingConn)
+	end
+end
+
+function DuplicateSiblingWatcher:stop()
+	self._tracking = false
+	for _, conn in ipairs(self._connections) do
+		conn:Disconnect()
+	end
+	self._connections = {}
+	for _, conn in pairs(self._nameConnections) do
+		conn:Disconnect()
+	end
+	self._nameConnections = {}
+end
+
+return DuplicateSiblingWatcher
+
+end
+
 _modules["ChangeDetector"] = function()
 local Config = _require("Config")
 local Serializer = _require("Serializer")
+local DuplicateSiblingWatcher = _require("DuplicateSiblingWatcher")
 
 -- New scripts from Studio get empty Source so sync matches VS Code (no default template race).
 local SCRIPT_CLASS_NAMES = {
@@ -1821,35 +1983,7 @@ function ChangeDetector:startTracking()
 				return
 			end
 
-			-- Dedup: rename if a sibling with the same name already exists
-			if descendant.Parent then
-				local baseName = descendant.Name
-				local hasDupe = false
-				for _, sibling in ipairs(descendant.Parent:GetChildren()) do
-					if sibling ~= descendant and sibling.Name == baseName then
-						hasDupe = true
-						break
-					end
-				end
-				if hasDupe then
-					local n = 2
-					while true do
-						local candidate = baseName .. "_" .. tostring(n)
-						local taken = false
-						for _, sibling in ipairs(descendant.Parent:GetChildren()) do
-							if sibling ~= descendant and sibling.Name == candidate then
-								taken = true
-								break
-							end
-						end
-						if not taken then
-							pcall(function() descendant.Name = candidate end)
-							break
-						end
-						n = n + 1
-					end
-				end
-			end
+			DuplicateSiblingWatcher.ensureUniqueAmongSiblings(descendant)
 
 			self:_trackInstance(descendant)
 
@@ -1979,36 +2113,7 @@ function ChangeDetector:_trackInstance(instance)
 
 		-- Handle renames before IGNORED_PROPERTIES check
 		if property == "Name" then
-			-- Dedup: check if new name collides with a sibling
-			if instance.Parent then
-				local newName = instance.Name
-				local hasDupe = false
-				for _, sibling in ipairs(instance.Parent:GetChildren()) do
-					if sibling ~= instance and sibling.Name == newName then
-						hasDupe = true
-						break
-					end
-				end
-				if hasDupe then
-					local baseName = newName
-					local n = 2
-					while true do
-						local candidate = baseName .. "_" .. tostring(n)
-						local taken = false
-						for _, sibling in ipairs(instance.Parent:GetChildren()) do
-							if sibling ~= instance and sibling.Name == candidate then
-								taken = true
-								break
-							end
-						end
-						if not taken then
-							pcall(function() instance.Name = candidate end)
-							return
-						end
-						n = n + 1
-					end
-				end
-			end
+			DuplicateSiblingWatcher.ensureUniqueAmongSiblings(instance)
 
 			local oldPath = self._pathCache[instance]
 			local finalName = instance.Name
@@ -2074,6 +2179,7 @@ local Config = _require("Config")
 local Serializer = _require("Serializer")
 local Deserializer = _require("Deserializer")
 local ChangeDetector = _require("ChangeDetector")
+local DuplicateSiblingWatcher = _require("DuplicateSiblingWatcher")
 local UI = _require("UI")
 
 local HttpService = game:GetService("HttpService")
@@ -2089,6 +2195,8 @@ local pingAlive = false
 local sessionId = nil
 local changeDetector = nil
 local watcherAlive = true
+local duplicateSiblingWatcher = DuplicateSiblingWatcher.new()
+duplicateSiblingWatcher:start()
 -- After a successful full sync; used to hide disconnect/poll noise during the brief VS Code reload window.
 local lastFullySyncedAt = 0
 local HANDOFF_GRACE_SEC = 8
@@ -2098,7 +2206,6 @@ local STUDIO_CONNECT_BANNER_COOLDOWN_SEC = 90
 -- Paths for which we echoed an Update after a VS Code create; filter duplicate ChangeDetector creates (incl. deferred scripts).
 local suppressedVscodeCreatePaths = {}
 -- Label for Studio output: matches API experience name when available (game.Name is often "Place 1").
-local lastConnectDisplayName = nil
 
 local function withinHandoffGrace(): boolean
 	return (os.clock() - lastFullySyncedAt) < HANDOFF_GRACE_SEC
@@ -2202,6 +2309,158 @@ local function dedupeUpdatesShadowedByCreatesInBatch(studioChanges)
 	return out
 end
 
+-- Roblox HttpService POST body limit is ~1024 KB; large places must full-sync in chunks.
+local FULL_SYNC_MAX_BYTES = 950000
+-- VS Code may start listening slightly after Studio posts; ConnectFail is common on first try.
+local FULL_SYNC_HTTP_ATTEMPTS = 12
+
+local function fullSyncPayloadByteLength(payload)
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(payload)
+	end)
+	if not ok or type(encoded) ~= "string" then
+		return math.huge
+	end
+	return #encoded
+end
+
+local function postFullSyncRaw(encodedBody)
+	local lastErr
+	for attempt = 1, FULL_SYNC_HTTP_ATTEMPTS do
+		local success, err = pcall(function()
+			HttpService:PostAsync(
+				getBaseUrl() .. "/full-sync",
+				encodedBody,
+				Enum.HttpContentType.ApplicationJson
+			)
+		end)
+		if success then
+			return true
+		end
+		lastErr = err
+		if attempt < FULL_SYNC_HTTP_ATTEMPTS then
+			task.wait(math.min(0.2 * attempt, 1.25))
+		end
+	end
+	return false, lastErr
+end
+
+local function postFullSyncPayload(payload)
+	local encoded = HttpService:JSONEncode(payload)
+	return postFullSyncRaw(encoded)
+end
+
+local function skeletonInstance(node)
+	return {
+		id = node.id,
+		className = node.className,
+		name = node.name,
+		properties = node.properties,
+		children = {},
+	}
+end
+
+local function splitAndPostChildren(parentPath, children)
+	local i = 1
+	local n = #children
+	while i <= n do
+		local batch = {}
+		while i <= n do
+			local cand = children[i]
+			local onePayload = {
+				mode = "children",
+				parentPath = parentPath,
+				instances = { cand },
+			}
+			if fullSyncPayloadByteLength(onePayload) > FULL_SYNC_MAX_BYTES then
+				if #batch > 0 then
+					break
+				end
+				local sk = skeletonInstance(cand)
+				local okSk, errSk = postFullSyncPayload({
+					mode = "children",
+					parentPath = parentPath,
+					instances = { sk },
+				})
+				if not okSk then
+					return false, errSk
+				end
+				if cand.children and #cand.children > 0 then
+					local childPath = parentPath .. "." .. sk.name
+					local okDeep, errDeep = splitAndPostChildren(childPath, cand.children)
+					if not okDeep then
+						return false, errDeep
+					end
+				end
+				i = i + 1
+				break
+			end
+			local trial = {}
+			for j = 1, #batch do
+				trial[j] = batch[j]
+			end
+			trial[#trial + 1] = cand
+			local trialPayload = {
+				mode = "children",
+				parentPath = parentPath,
+				instances = trial,
+			}
+			if fullSyncPayloadByteLength(trialPayload) > FULL_SYNC_MAX_BYTES then
+				break
+			end
+			batch = trial
+			i = i + 1
+		end
+		if #batch > 0 then
+			local okB, errB = postFullSyncPayload({
+				mode = "children",
+				parentPath = parentPath,
+				instances = batch,
+			})
+			if not okB then
+				return false, errB
+			end
+		end
+	end
+	return true
+end
+
+local function postServiceOrSplit(serviceNode)
+	local rootsPayload = {
+		mode = "roots",
+		roots = { serviceNode },
+	}
+	if fullSyncPayloadByteLength(rootsPayload) <= FULL_SYNC_MAX_BYTES then
+		return postFullSyncPayload(rootsPayload)
+	end
+	local sk = skeletonInstance(serviceNode)
+	local skPayload = {
+		mode = "roots",
+		roots = { sk },
+	}
+	if fullSyncPayloadByteLength(skPayload) > FULL_SYNC_MAX_BYTES then
+		return false, "single service root exceeds full-sync chunk limit"
+	end
+	local okSk, errSk = postFullSyncPayload(skPayload)
+	if not okSk then
+		return false, errSk
+	end
+	if serviceNode.children and #serviceNode.children > 0 then
+		return splitAndPostChildren(serviceNode.name, serviceNode.children)
+	end
+	return true
+end
+
+local function postFullSyncEndSafe()
+	pcall(function()
+		HttpService:PostAsync(
+			getBaseUrl() .. "/full-sync",
+			HttpService:JSONEncode({ mode = "end" }),
+			Enum.HttpContentType.ApplicationJson
+		)
+	end)
+end
+
 local function doFullSync()
 	Serializer.renameLiveInstancesForDuplicateNames = false
 
@@ -2215,15 +2474,40 @@ local function doFullSync()
 
 	Serializer.renameLiveInstancesForDuplicateNames = true
 
-	local body = HttpService:JSONEncode({ tree = tree })
-	local success, err = pcall(function()
-		HttpService:PostAsync(getBaseUrl() .. "/full-sync", body, Enum.HttpContentType.ApplicationJson)
-	end)
+	local legacyBody = { tree = tree }
+	if fullSyncPayloadByteLength(legacyBody) <= FULL_SYNC_MAX_BYTES then
+		local encodedLegacy = HttpService:JSONEncode(legacyBody)
+		local success, err = postFullSyncRaw(encodedLegacy)
+		if not success then
+			warn(LOG_PREFIX .. " error: full sync failed: " .. tostring(err))
+			return false
+		end
+		return true
+	end
 
-	if not success then
-		warn(LOG_PREFIX .. " error: full sync failed: " .. tostring(err))
+	local okBegin, errBegin = postFullSyncPayload({ mode = "begin" })
+	if not okBegin then
+		warn(LOG_PREFIX .. " error: full sync failed: " .. tostring(errBegin))
+		postFullSyncEndSafe()
 		return false
 	end
+
+	for _, svc in ipairs(tree) do
+		local ok, err = postServiceOrSplit(svc)
+		if not ok then
+			warn(LOG_PREFIX .. " error: full sync failed: " .. tostring(err))
+			postFullSyncEndSafe()
+			return false
+		end
+	end
+
+	local okEnd, errEnd = postFullSyncPayload({ mode = "end" })
+	if not okEnd then
+		warn(LOG_PREFIX .. " error: full sync failed: " .. tostring(errEnd))
+		postFullSyncEndSafe()
+		return false
+	end
+
 	return true
 end
 
@@ -2380,9 +2664,7 @@ local function disconnect(silent, quietLog)
 	sessionId = nil
 	suppressedVscodeCreatePaths = {}
 	if quietLog ~= true then
-		local label = lastConnectDisplayName or (game.Name or "Unnamed")
-		lastConnectDisplayName = nil
-		logLine("Disconnected (" .. label .. ")")
+		logLine("Disconnected from VS Code")
 	end
 	if not silent then
 		UI.showNotification("Disconnected from VS Code.")
@@ -2431,6 +2713,142 @@ local function startPingLoop()
 	end)
 end
 
+--- Experience title for logs / VS Code (not the document tab name: Place1, Place2, …).
+local function tryNameFromUniverseId(universeId, placeFileName)
+	if type(universeId) ~= "number" or universeId <= 0 then
+		return nil
+	end
+
+	local MarketplaceService = game:GetService("MarketplaceService")
+	local okMp, productInfo = pcall(function()
+		return MarketplaceService:GetProductInfo(universeId, Enum.InfoType.Game)
+	end)
+	if okMp and type(productInfo) == "table" then
+		local n = productInfo.Name or productInfo.name
+		if type(n) == "string" and n ~= "" then
+			return n
+		end
+	end
+
+	for attempt = 1, 4 do
+		local ok2, gameResp = pcall(function()
+			return HttpService:GetAsync("https://games.roblox.com/v1/games?universeIds=" .. tostring(universeId))
+		end)
+		if ok2 and type(gameResp) == "string" and gameResp ~= "" then
+			local decodeOk, gameData = pcall(function()
+				return HttpService:JSONDecode(gameResp)
+			end)
+			if decodeOk and type(gameData) == "table" then
+				local row = gameData.data and gameData.data[1]
+				if type(row) == "table" and type(row.name) == "string" and row.name ~= "" then
+					return row.name
+				end
+			end
+		end
+		if attempt < 4 then
+			task.wait(0.2 * attempt)
+		end
+	end
+
+	return nil
+end
+
+local function tryMultigetPlaceDetails(placeId)
+	if type(placeId) ~= "number" or placeId <= 0 then
+		return nil, nil
+	end
+	local url = "https://games.roblox.com/v1/games/multiget-place-details?placeIds=" .. tostring(placeId)
+	for attempt = 1, 4 do
+		local ok, resp = pcall(function()
+			return HttpService:GetAsync(url)
+		end)
+		if ok and type(resp) == "string" and resp ~= "" then
+			local decOk, data = pcall(function()
+				return HttpService:JSONDecode(resp)
+			end)
+			if decOk and type(data) == "table" then
+				local rows = data.places or data.placeDetails or data.data or data
+				if type(rows) == "table" and type(rows[1]) == "table" then
+					local row = rows[1]
+					local uid = row.universeId or row.universeID
+					local n = row.name or row.sourceName
+					if type(uid) == "number" and uid > 0 and type(n) == "string" and n ~= "" then
+						return n, uid
+					end
+					if type(n) == "string" and n ~= "" then
+						return n, type(uid) == "number" and uid > 0 and uid or nil
+					end
+					if type(uid) == "number" and uid > 0 then
+						return nil, uid
+					end
+				end
+			end
+		end
+		if attempt < 4 then
+			task.wait(0.2 * attempt)
+		end
+	end
+	return nil, nil
+end
+
+local function resolveExperienceDisplayName(placeId, placeFileName)
+	local universeId = nil
+	local okGid, gid = pcall(function()
+		return game.GameId
+	end)
+	if okGid and type(gid) == "number" and gid > 0 then
+		universeId = gid
+	end
+
+	local fromMarket = universeId and tryNameFromUniverseId(universeId, placeFileName) or nil
+	if fromMarket then
+		return fromMarket
+	end
+
+	if type(placeId) == "number" and placeId > 0 then
+		local multiName, multiUniverse = tryMultigetPlaceDetails(placeId)
+		if type(multiName) == "string" and multiName ~= "" then
+			return multiName
+		end
+		if not universeId and type(multiUniverse) == "number" and multiUniverse > 0 then
+			universeId = multiUniverse
+			local fromMultiU = tryNameFromUniverseId(universeId, placeFileName)
+			if fromMultiU then
+				return fromMultiU
+			end
+		end
+	end
+
+	if not universeId and type(placeId) == "number" and placeId > 0 then
+		for attempt = 1, 4 do
+			local ok, uniResp = pcall(function()
+				return HttpService:GetAsync("https://apis.roblox.com/universes/v1/places/" .. tostring(placeId) .. "/universe")
+			end)
+			if ok and type(uniResp) == "string" and uniResp ~= "" then
+				local decodeOk, uniData = pcall(function()
+					return HttpService:JSONDecode(uniResp)
+				end)
+				if decodeOk and type(uniData) == "table" and type(uniData.universeId) == "number" and uniData.universeId > 0 then
+					universeId = uniData.universeId
+					break
+				end
+			end
+			if attempt < 4 then
+				task.wait(0.2 * attempt)
+			end
+		end
+	end
+
+	if universeId then
+		local n = tryNameFromUniverseId(universeId, placeFileName)
+		if n then
+			return n
+		end
+	end
+
+	return placeFileName
+end
+
 --- @param silent boolean if true, omit connection-failed toast (used while polling until server is up)
 local function connect(silent)
 	if connected then
@@ -2442,7 +2860,15 @@ local function connect(silent)
 
 	local placeId = game.PlaceId or 0
 	local placeName = game.Name or "Unnamed"
-	local experienceName = placeName
+	local gameId = 0
+	do
+		local okGi, gi = pcall(function()
+			return game.GameId
+		end)
+		if okGi and type(gi) == "number" and gi > 0 then
+			gameId = gi
+		end
+	end
 	local structureHash = ""
 	if placeId == 0 then
 		local parts = {}
@@ -2458,25 +2884,10 @@ local function connect(silent)
 			h = (h * 31 + string.byte(str, i)) % 2147483647
 		end
 		structureHash = tostring(math.abs(h))
-	else
-		local ok, uniResp = pcall(function()
-			return HttpService:GetAsync("https://apis.roblox.com/universes/v1/places/" .. tostring(placeId) .. "/universe")
-		end)
-		if ok and uniResp then
-			local uniData = HttpService:JSONDecode(uniResp)
-			if uniData and uniData.universeId then
-				local ok2, gameResp = pcall(function()
-					return HttpService:GetAsync("https://games.roblox.com/v1/games?universeIds=" .. tostring(uniData.universeId))
-				end)
-				if ok2 and gameResp then
-					local gameData = HttpService:JSONDecode(gameResp)
-					if gameData and gameData.data and gameData.data[1] and gameData.data[1].name then
-						experienceName = gameData.data[1].name
-					end
-				end
-			end
-		end
 	end
+
+	-- Always resolve display title: PlaceId can be 0 while game.GameId still identifies the live experience.
+	local experienceName = resolveExperienceDisplayName(placeId, placeName)
 
 	local connectUrl = getBaseUrl() .. "/connect"
 	local connectStartedAt = os.clock()
@@ -2486,11 +2897,12 @@ local function connect(silent)
 		return HttpService:PostAsync(
 			connectUrl,
 			HttpService:JSONEncode({
-				version = "1.4.0",
+				version = "1.5.0",
 				placeId = placeId,
 				placeName = placeName,
 				experienceName = experienceName,
 				structureHash = structureHash,
+				gameId = gameId,
 			}),
 			Enum.HttpContentType.ApplicationJson
 		)
@@ -2516,8 +2928,7 @@ local function connect(silent)
 		startPolling()
 		startPingLoop()
 		if allowConnectBanner then
-			lastConnectDisplayName = experienceName
-			logLine("Connected (" .. experienceName .. ")")
+			logLine("Connected to VS Code")
 			lastStudioConnectBannerAt = os.clock()
 		end
 	else
@@ -2530,6 +2941,7 @@ end
 
 plugin.Unloading:Connect(function()
 	watcherAlive = false
+	duplicateSiblingWatcher:stop()
 	disconnect(true)
 end)
 

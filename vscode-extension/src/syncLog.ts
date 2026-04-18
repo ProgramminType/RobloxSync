@@ -25,8 +25,8 @@ export function line(msg: string): void {
   channel().appendLine(`${PREFIX} ${msg}`);
 }
 
-export function connected(detail?: string): void {
-  line(detail ? `Connected (${detail})` : "Connected");
+export function connected(): void {
+  line("Connected to Studio");
 }
 
 export function disconnected(detail?: string): void {

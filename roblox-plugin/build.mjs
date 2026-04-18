@@ -80,6 +80,7 @@ const modules = [
   "modules/HttpClient.lua",
   "modules/Serializer.lua",
   "modules/Deserializer.lua",
+  "modules/DuplicateSiblingWatcher.lua",
   "modules/ChangeDetector.lua",
 ];
 
@@ -97,7 +98,7 @@ function buildPlugin() {
   const entrySource = readModule("init.server.lua");
 
   let output = `--[=[
-  Roblox Sync Plugin v1.4.0
+  Roblox Sync Plugin v1.5.0
   Auto-generated — do not edit directly.
   Edit the source files in roblox-plugin/src/ instead.
 ]=]

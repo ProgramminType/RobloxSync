@@ -49,6 +49,51 @@ function Serializer.getInstanceDotPath(instance)
 	return table.concat(segments, ".")
 end
 
+--- Stem + numeric suffix for sibling dedup: `Part` / `Part1` / `Part2` (compact) or legacy `Part_2`.
+--- Unnumbered name counts as index 1.
+function Serializer.stemAndSuffixIndex(name)
+	local stemU, numStr = string.match(name, "^(.+)_([0-9]+)$")
+	if stemU and numStr then
+		return stemU, tonumber(numStr) or 1
+	end
+	local i = #name
+	while i >= 1 do
+		local c = string.byte(name, i)
+		if c < 48 or c > 57 then
+			break
+		end
+		i = i - 1
+	end
+	if i < #name and i >= 1 then
+		local stem = string.sub(name, 1, i)
+		local run = string.sub(name, i + 1)
+		if stem ~= "" and run ~= "" then
+			return stem, tonumber(run) or 1
+		end
+	end
+	return name, 1
+end
+
+--- Next sibling name not in `occupied` (e.g. Part + Part → Part2; Part2 + Part2 → Part3). Uses Part2 not Part_2.
+function Serializer.nextUniqueSiblingName(baseName, occupied)
+	local stem = Serializer.stemAndSuffixIndex(baseName)
+	local maxN = 0
+	for occName, _ in pairs(occupied) do
+		local s, idx = Serializer.stemAndSuffixIndex(occName)
+		if s == stem then
+			maxN = math.max(maxN, idx)
+		end
+	end
+	local n = maxN + 1
+	while true do
+		local candidate = stem .. tostring(n)
+		if not occupied[candidate] then
+			return candidate
+		end
+		n = n + 1
+	end
+end
+
 function Serializer.serializeInstance(instance)
 	if Config.NON_SERIALIZABLE_CLASSES[instance.ClassName] then
 		return nil
@@ -84,25 +129,23 @@ function Serializer.serializeInstance(instance)
 		end
 	end
 
-	local usedNames = {}
+	local occupied: { [string]: boolean } = {}
 	local renameLive = Serializer.renameLiveInstancesForDuplicateNames == true
 	for _, child in ipairs(instance:GetChildren()) do
 		local childData = Serializer.serializeInstance(child)
 		if childData then
 			local baseName = childData.name
-			if usedNames[baseName] then
-				local n = usedNames[baseName] + 1
-				usedNames[baseName] = n
-				local newName = baseName .. "_" .. tostring(n)
-				childData.name = newName
+			local finalName = baseName
+			if occupied[baseName] then
+				finalName = Serializer.nextUniqueSiblingName(baseName, occupied)
+				childData.name = finalName
 				if renameLive then
 					pcall(function()
-						child.Name = newName
+						child.Name = finalName
 					end)
 				end
-			else
-				usedNames[baseName] = 1
 			end
+			occupied[finalName] = true
 			table.insert(data.children, childData)
 		end
 	end

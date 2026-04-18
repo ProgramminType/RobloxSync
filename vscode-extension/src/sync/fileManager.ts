@@ -120,6 +120,63 @@ export class FileManager {
     }
   }
 
+  /** Start a chunked full sync: wipe synced service dirs and reset the in-memory tree cache. */
+  beginFullSync(): void {
+    this.lastTree = [];
+    for (const serviceName of SYNCED_SERVICES) {
+      const serviceDir = path.join(this.projectRoot, serviceName);
+      if (fs.existsSync(serviceDir)) {
+        fs.rmSync(serviceDir, { recursive: true, force: true });
+      }
+    }
+  }
+
+  /** Append top-level service roots (each a full subtree, or a skeleton with empty children to be filled by appendFullSyncChildren). */
+  appendFullSyncRoots(roots: InstanceData[]): void {
+    for (const root of roots) {
+      this.writeInstance(root, this.projectRoot, root.name, true);
+      this.lastTree.push(root);
+    }
+  }
+
+  /** Append instances as direct children of an existing path (dot path, e.g. Workspace or Workspace.Folder). */
+  appendFullSyncChildren(parentDotPath: string, instances: InstanceData[]): void {
+    if (instances.length === 0) {
+      return;
+    }
+    const parentDir = this.mapper.instancePathToDir(parentDotPath);
+    ensureDir(parentDir);
+    const dotPrefix = FileManager.normalizeInstancePathKey(parentDotPath);
+    for (const inst of instances) {
+      this.writeInstance(inst, parentDir, `${dotPrefix}.${inst.name}`, true);
+    }
+    const parentNode = this.findNodeInLastTree(parentDotPath);
+    if (parentNode) {
+      for (const inst of instances) {
+        parentNode.children.push(inst);
+      }
+    }
+  }
+
+  private findNodeInLastTree(dotPath: string): InstanceData | null {
+    const parts = FileManager.normalizeInstancePathKey(dotPath)
+      .split(".")
+      .filter((p) => p.length > 0);
+    if (parts.length === 0) {
+      return null;
+    }
+    let nodes: InstanceData[] = this.lastTree;
+    let current: InstanceData | null = null;
+    for (const part of parts) {
+      current = nodes.find((n) => n.name === part) ?? null;
+      if (!current) {
+        return null;
+      }
+      nodes = current.children;
+    }
+    return current;
+  }
+
   /**
    * Restore a previously synced service from the cached full tree.
    * Returns true if the service was found and restored.
